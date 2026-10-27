@@ -1,0 +1,41 @@
+# StackChan kit: voice server + local speech-to-text.
+# Setup: see ../README.md. Start with:  docker compose up -d --build
+services:
+  xiaozhi:
+    build: .
+    image: stackchan-kit-server:local
+    container_name: stackchan-server
+    restart: unless-stopped
+    security_opt:
+      - seccomp:unconfined   # as upstream's compose file
+    environment:
+      TZ: Europe/Copenhagen  # change to your timezone
+    ports:
+      - "8000:8000"   # robot <-> server voice WebSocket
+      - "8003:8003"   # robot config/update check + camera photo upload
+    volumes:
+      - ./data:/opt/xiaozhi-esp32-server/data
+    depends_on:
+      - speaches
+
+  # Local Whisper speech-to-text, so your voice never leaves your machine.
+  # CPU image; switch to the -cuda tag if you have an NVIDIA GPU.
+  speaches:
+    image: ghcr.io/speaches-ai/speaches:latest-cpu
+    container_name: stackchan-stt
+    restart: unless-stopped
+    volumes:
+      - speaches-models:/home/ubuntu/.cache/huggingface/hub
+
+  # One-shot: download the Whisper model into speaches on first start.
+  whisper-model:
+    image: curlimages/curl:latest
+    restart: "no"
+    depends_on:
+      - speaches
+    command: >
+      sh -c "until curl -sf http://speaches:8000/health >/dev/null; do sleep 2; done;
+             curl -sf -X POST http://speaches:8000/v1/models/Systran/faster-whisper-small && echo model ready"
+
+volumes:
+  speaches-models:

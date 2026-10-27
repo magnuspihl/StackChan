@@ -1,0 +1,5 @@
+# Your config holds API keys: never commit it.
+server/data/
+# Build output and the factory firmware backup.
+firmware/out/
+*.bin

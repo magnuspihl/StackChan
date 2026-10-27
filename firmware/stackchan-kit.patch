@@ -1,0 +1,155 @@
+diff --git a/firmware/main/hal/board/stackchan_display.cc b/firmware/main/hal/board/stackchan_display.cc
+index 7459888..d1c8f36 100644
+--- a/firmware/main/hal/board/stackchan_display.cc
++++ b/firmware/main/hal/board/stackchan_display.cc
+@@ -18,6 +18,9 @@
+ #include <assets/lang_config.h>
+ #include <hal/hal.h>
+ 
++// Kit patch: ASCII so it renders in any font (the original used U+2026).
++static constexpr const char* kSleepSpeech = "Zzz...";
++
+ using namespace stackchan;
+ using namespace stackchan::avatar;
+ 
+@@ -326,30 +329,67 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
+         return;
+     }
+ 
++    // Kit patch: entering idle makes the app reset the face to "neutral".
++    // While asleep, keep the sleep face; a new session (SetStatus with
++    // CONNECTING) clears is_sleeping_ first, so waking still works.
++    if (is_sleeping_ && strcmp(emotion, "neutral") == 0) {
++        return;
++    }
++
+     DisplayLockGuard lock(this);
+ 
+     // ESP_LOGE(TAG, "SetEmotion: %s", emotion);
+ 
+     auto& avatar = stackchan.avatar();
+ 
+-    // Map emotion string to stackchan::Emotion
++    // Kit patch: every emotion first resets the per-emotion tweaks below, so a
++    // surprised or thinking face never leaks into the next one.
++    avatar.leftEye().setSize(0);
++    avatar.rightEye().setSize(0);
++    avatar.leftEye().setPosition(uitk::Vector2i(0, 0));
++    avatar.rightEye().setPosition(uitk::Vector2i(0, 0));
++    if (strcmp(emotion, "sleepy") != 0) {
++        avatar.mouth().setWeight(0);
++    }
++
++    // Map emotion string to stackchan::Emotion. Names come from the server's
++    // emoji map (xiaozhi core/utils/textUtils.py EMOJI_MAP).
+     if (strcmp(emotion, "neutral") == 0) {
+         avatar.setEmotion(Emotion::Neutral);
+-    } else if (strcmp(emotion, "happy") == 0) {
+-        avatar.setEmotion(Emotion::Happy);
+-    } else if (strcmp(emotion, "laughing") == 0) {
++    } else if (strcmp(emotion, "happy") == 0 || strcmp(emotion, "laughing") == 0 ||
++               strcmp(emotion, "funny") == 0 || strcmp(emotion, "silly") == 0 ||
++               strcmp(emotion, "relaxed") == 0 || strcmp(emotion, "winking") == 0 ||
++               strcmp(emotion, "cool") == 0 || strcmp(emotion, "confident") == 0 ||
++               strcmp(emotion, "delicious") == 0) {
+         avatar.setEmotion(Emotion::Happy);
+     } else if (strcmp(emotion, "angry") == 0) {
+         avatar.setEmotion(Emotion::Angry);
+-    } else if (strcmp(emotion, "sad") == 0) {
+-        avatar.setEmotion(Emotion::Sad);
+-    } else if (strcmp(emotion, "crying") == 0) {
++    } else if (strcmp(emotion, "sad") == 0 || strcmp(emotion, "crying") == 0) {
+         avatar.setEmotion(Emotion::Sad);
++    } else if (strcmp(emotion, "surprised") == 0 || strcmp(emotion, "shocked") == 0) {
++        // Kit patch: wide eyes and a round "o" mouth.
++        avatar.setEmotion(Emotion::Neutral);
++        avatar.leftEye().setSize(70);
++        avatar.rightEye().setSize(70);
++        avatar.mouth().setWeight(45);
++    } else if (strcmp(emotion, "thinking") == 0) {
++        // Kit patch: skeptical brows, eyes glancing up and to the side.
++        avatar.setEmotion(Emotion::Doubt);
++        avatar.leftEye().setPosition(uitk::Vector2i(60, -70));
++        avatar.rightEye().setPosition(uitk::Vector2i(60, -70));
++    } else if (strcmp(emotion, "loving") == 0 || strcmp(emotion, "kissy") == 0) {
++        // Kit patch: happy eyes plus the built-in floating heart for a few seconds.
++        avatar.setEmotion(Emotion::Happy);
++        avatar.addDecorator(std::make_unique<HeartDecorator>(lv_screen_active(), 3000));
++    } else if (strcmp(emotion, "embarrassed") == 0) {
++        avatar.setEmotion(Emotion::Happy);
++        avatar.addDecorator(std::make_unique<ShyDecorator>(lv_screen_active(), 3000));
++    } else if (strcmp(emotion, "confused") == 0 || strcmp(emotion, "doubtful") == 0) {
++        avatar.setEmotion(Emotion::Doubt);
+     } else if (strcmp(emotion, "sleepy") == 0) {
+         avatar.setEmotion(Emotion::Sleepy);
+-        avatar.setSpeech("Zzz…");
++        avatar.setSpeech(kSleepSpeech);
+         is_sleeping_ = true;
+-        // avatar.mouth().setWeight(10);
+ 
+         // Stop idle motion
+         ESP_LOGW(TAG, "Stop idle motion");
+@@ -363,9 +403,6 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
+         // Return to default pose
+         auto& motion = GetStackChan().motion();
+         motion.pitchServo().moveWithSpeed(0, 80);
+-
+-    } else if (strcmp(emotion, "doubtful") == 0) {
+-        avatar.setEmotion(Emotion::Doubt);
+     } else {
+         ESP_LOGW(TAG, "Unknown emotion: %s, using NEUTRAL", emotion);
+         avatar.setEmotion(Emotion::Neutral);
+@@ -410,6 +447,10 @@ void StackChanAvatarDisplay::ClearChatMessages()
+     DisplayLockGuard lock(this);
+ 
+     stackchan.avatar().clearSpeech();
++    // Kit patch: entering idle clears chat text; keep the sleep bubble.
++    if (is_sleeping_) {
++        stackchan.avatar().setSpeech(kSleepSpeech);
++    }
+ 
+     ESP_LOGI(TAG, "Chat messages cleared");
+ }
+@@ -532,7 +573,11 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
+         avatar.setSpeech(status);
+     }
+ 
+-    if (is_idle) {
++    if (is_idle && is_sleeping_) {
++        // Kit patch: going idle after "go to sleep" keeps the sleep face and
++        // leaves idle motion off, so the servos rest and release torque.
++        _is_xiaozhi_idle = true;
++    } else if (is_idle) {
+         // Start idle motion
+         ESP_LOGW(TAG, "Start idle motion");
+         if (idle_motion_modifier_id_ < 0) {
+@@ -562,9 +607,13 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
+         _is_xiaozhi_idle = false;
+     }
+ 
+-    // Clear sleep state
+-    if (is_sleeping_) {
++    // Kit patch: only a NEW session (connecting, after a wake word or tap) wakes
++    // StackChan. The goodbye ends speaking -> listening -> idle inside the old
++    // session, so listening alone must not wake it.
++    if (is_sleeping_ && strcmp(status, Lang::Strings::CONNECTING) == 0) {
++        is_sleeping_ = false;
+         avatar.setSpeech("");
++        avatar.setEmotion(Emotion::Neutral);
+     }
+ }
+ 
+diff --git a/firmware/main/stackchan/avatar/skins/default/eyes.cpp b/firmware/main/stackchan/avatar/skins/default/eyes.cpp
+--- a/firmware/main/stackchan/avatar/skins/default/eyes.cpp
++++ b/firmware/main/stackchan/avatar/skins/default/eyes.cpp
+@@ -116,7 +116,9 @@ void DefaultEyes::setEmotion(const Emotion& emotion)
+             apply_style(75, 0);
+             break;
+         case Emotion::Sleepy:
+-            apply_style(35, -50);
++            // Kit patch: level, nearly closed slits read as asleep; the
++            // original droopy, tilted eyes (35, -50) looked sad.
++            apply_style(12, 0);
+             break;
+         default:
+             break;

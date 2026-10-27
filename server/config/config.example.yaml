@@ -1,0 +1,112 @@
+# StackChan kit configuration. Copy to server/data/.config.yaml and edit the
+# three places marked "CHANGE ME". Anything not listed here falls back to the
+# upstream config.yaml, which defaults to Chinese cloud services, so keep every
+# selected module defined below.
+
+server:
+  ip: 0.0.0.0
+  port: 8000
+  http_port: 8003
+  # CHANGE ME: this machine's LAN IP. The robot is told to connect here.
+  websocket: ws://192.168.1.50:8000/xiaozhi/v1/
+  vision_explain: http://192.168.1.50:8003/mcp/vision/explain
+  timezone_offset: +1     # hours from UTC
+  auth:
+    enabled: false        # LAN only; don't expose ports 8000/8003 to the internet
+
+# Personality. The behaviour rules (short replies, tools, faces) live in
+# data/kit-prompt.txt; this is just who the robot is.
+prompt: |
+  You are Stack-chan, a small desk robot with a round face, a camera, and a head
+  that can pan and tilt. You speak out loud through a tiny speaker, so keep replies
+  short and conversational. You are curious, a little cheeky, and genuinely
+  helpful. Use your tools to move your head or change your LED colour when it fits
+  the moment, and use the camera when asked what you can see.
+
+prompt_template: data/kit-prompt.txt
+end_prompt:
+  enable: false
+enable_wakeup_words_response_cache: false
+
+# Whole-utterance phrases that end the conversation instantly (no LLM call).
+# Case, spaces and punctuation are ignored. Anything fuzzier goes to the LLM,
+# which can call its sleep tool when it understands you want to stop.
+exit_commands:
+  - "goodbye"
+  - "go to sleep"
+  - "you can go to sleep"
+  - "go to sleep now"
+  - "goodnight"
+  - "good night"
+
+selected_module:
+  VAD: SileroVAD
+  ASR: LocalWhisper
+  LLM: MainLLM
+  VLLM: VisionLLM
+  TTS: EdgeVoice
+  Memory: nomem
+  Intent: function_call
+
+Intent:
+  function_call:
+    type: function_call
+    # Server-side tools. The robot's own tools (head, LED, camera, sleep) are
+    # always available. Add "web_search" here to enable search (see below).
+    functions: []
+
+# Speech-to-text: the local speaches container from docker-compose.yml.
+ASR:
+  LocalWhisper:
+    type: openai
+    api_key: none
+    base_url: http://speaches:8000/v1/audio/transcriptions
+    model_name: Systran/faster-whisper-small
+    language: en
+    output_dir: tmp/
+
+# The brain. Any OpenAI-compatible API works; swap base_url/model_name/api_key.
+# CHANGE ME: put your API key in both LLM and VLLM below.
+LLM:
+  MainLLM:
+    type: openai
+    base_url: https://api.anthropic.com/v1/
+    model_name: claude-haiku-5-5
+    api_key: YOUR_API_KEY
+    max_tokens: 400
+  # Alternative: OpenAI
+  # MainLLM:
+  #   type: openai
+  #   base_url: https://api.openai.com/v1
+  #   model_name: <a small, fast model>
+  #   api_key: YOUR_API_KEY
+
+# Vision: used only when the camera tool takes a photo. Note: this block uses
+# `url:`, not `base_url:` (an upstream quirk).
+VLLM:
+  VisionLLM:
+    type: openai
+    url: https://api.anthropic.com/v1/
+    model_name: claude-haiku-5-5
+    api_key: YOUR_API_KEY
+    language: English
+
+# Text-to-speech: Microsoft Edge voices (free, no key; the reply text is sent to
+# Microsoft). Other voices: en-GB-SoniaNeural, en-US-GuyNeural, da-DK-ChristelNeural.
+TTS:
+  EdgeVoice:
+    type: edge
+    voice: en-US-AnaNeural
+    language: English
+    output_dir: tmp/
+
+# --- Web search (optional) ----------------------------------------------------
+# Off by default. To enable: put a Tavily API key below (tavily.com, free tier)
+# and add "web_search" to Intent.function_call.functions. Upstream defaults to
+# Metaso (a Chinese engine), so the provider is pinned to Tavily here. This makes
+# the SERVER reach the internet; the robot itself never needs to.
+plugins:
+  web_search:
+    provider: tavily
+    max_results: 3
+    api_key: ""
