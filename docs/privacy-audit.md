@@ -30,10 +30,12 @@ No pconline, QWeather or Chinese hosts. DNS queries were only for the TTS and
 LLM hostnames.
 
 **Robot.** It was blocked from the internet with a router rule (LAN only) and
-used normally: chat, photos, sleep and wake all worked, and the router logged
-**no blocked attempts**. It doesn't need the internet, and hasn't tried.
-(First measured over a test session; a longer idle window is being checked
-for anything periodic.)
+used normally: chat, photos, sleep and wake all worked, so it doesn't need the
+internet. Over about 3 hours the router logged 26 blocked attempts, **all NTP
+time sync** (UDP 123 to `pool.ntp.org`, `time.cloudflare.com` and
+`2.android.pool.ntp.org`, roughly every 165 seconds). These are clock requests
+with no data in them, from the firmware's SNTP client (`hal_network.cpp`).
+Nothing else was attempted: no xiaozhi, M5 or Chinese hosts.
 
 ## Reproduce it
 

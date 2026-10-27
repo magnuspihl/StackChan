@@ -93,9 +93,11 @@ it). Things to try: *"Look up at the ceiling and turn your light blue."*,
 
 On your router, add a rule that blocks the robot's MAC address from the
 internet (LAN traffic still allowed). On UniFi: Settings → Security → Traffic
-Rules → Block → Internet → target the robot. It needs nothing outside your LAN;
-this turns "trust me" into "enforced", and any attempt shows up in your router
-logs.
+Rules → Block → Internet → target the robot. This turns "trust me" into
+"enforced", and any attempt shows up in your router logs. The only thing it
+tries is NTP time sync (`pool.ntp.org`, UDP 123, every few minutes), which is
+harmless and carries no data. Allow UDP 123 in the rule if you want its clock
+synced; it works fine without.
 
 ## Settings
 
