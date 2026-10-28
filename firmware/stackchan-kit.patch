@@ -363,19 +363,24 @@ index f16f1f3..10fd330 100644
  
      lv_obj_t* preview_image_                         = nullptr;
 diff --git a/firmware/main/hal/hal_mcp.cpp b/firmware/main/hal/hal_mcp.cpp
-index 0d73851..c257f65 100644
+index 0d73851..192f411 100644
 --- a/firmware/main/hal/hal_mcp.cpp
 +++ b/firmware/main/hal/hal_mcp.cpp
-@@ -4,6 +4,8 @@
+@@ -4,9 +4,13 @@
   * SPDX-License-Identifier: MIT
   */
  #include "hal.h"
 +#include <algorithm>
++#include <cstdio>
 +#include <stdexcept>
  #include <mooncake_log.h>
  #include <mcp_server.h>
  #include <stackchan/stackchan.h>
-@@ -72,8 +74,9 @@ void Hal::xiaozhi_mcp_init()
++#include <stackchan/modifiers/head_loop.h>
+ #include <apps/common/common.h>
+ 
+ using namespace stackchan;
+@@ -72,8 +76,9 @@ void Hal::xiaozhi_mcp_init()
      mclog::tagInfo(_tag, "add robot.set_led_color tool");
      mcp_server.AddTool(
          "self.robot.set_led_color",
@@ -387,7 +392,7 @@ index 0d73851..c257f65 100644
          PropertyList({Property("red", kPropertyTypeInteger, 0, 0, 168),
                        Property("green", kPropertyTypeInteger, 0, 0, 168),
                        Property("blue", kPropertyTypeInteger, 0, 0, 168)}),
-@@ -92,6 +95,91 @@ void Hal::xiaozhi_mcp_init()
+@@ -92,6 +97,173 @@ void Hal::xiaozhi_mcp_init()
              return true;
          });
  
@@ -472,6 +477,88 @@ index 0d73851..c257f65 100644
 +                }
 +                index++;
 +                start = end + 1;
++            }
++            return true;
++        });
++
++    // Kit: looping head moves (dances, gestures), like the LED effects.
++    mclog::tagInfo(_tag, "add robot.animate_head tool");
++    mcp_server.AddTool(
++        "self.robot.animate_head",
++        "Move your head in a flowing, repeating pattern for a while: dance, nod, shake your head, look around. "
++        "Patterns: sway (side to side), bounce, groove (a figure of eight), wiggle (quick shimmy), nod (yes), "
++        "shake (no), look_around (slow scan), robot (stiff, jerky), custom, stop. It keeps going while you "
++        "talk, so for a dance pick about as many seconds as your reply takes plus a few (8-15). "
++        "tempo: 100 normal, 150 faster, 70 slower. custom: `steps` = yaw,pitch,ms;yaw,pitch,ms;... as offsets "
++        "in degrees from where you are looking (yaw negative = your left, pitch positive = up), ms until the "
++        "next point (300-500 is lively); up "
++        "to 20 points, looped. The head returns to where it was. Head only: for a real dance also start your "
++        "reply with a fitting face emoji and try set_led_effect.",
++        PropertyList({Property("pattern", kPropertyTypeString, std::string("sway")),
++                      Property("seconds", kPropertyTypeInteger, 10, 1, 30),
++                      Property("tempo", kPropertyTypeInteger, 100, 30, 300),
++                      Property("steps", kPropertyTypeString, std::string(""))}),
++        [this](const PropertyList& properties) -> ReturnValue {
++            static int loop_id        = -1;
++            const std::string pattern = properties["pattern"].value<std::string>();
++            const int seconds         = properties["seconds"].value<int>();
++            const float tempo         = properties["tempo"].value<int>() / 100.0f;
++
++            // Offsets in degrees from where the head looks; hold = ms to the next point.
++            std::vector<HeadStep> steps;
++            int speed = 800;  // servo spring: 1000 snaps, 300 drifts
++            if (pattern == "sway") {
++                steps = {{-35, -6, 330}, {0, 8, 330}, {35, -6, 330}, {0, 8, 330}};
++                speed = 700;
++            } else if (pattern == "bounce") {
++                steps = {{-8, 16, 300}, {0, -12, 300}, {8, 16, 300}, {0, -12, 300}};
++                speed = 900;
++            } else if (pattern == "groove") {
++                steps = {{-30, 14, 360}, {0, -10, 360}, {30, 14, 360}, {0, -10, 360}};
++                speed = 800;
++            } else if (pattern == "wiggle") {
++                steps = {{-14, 4, 170}, {14, -4, 170}};
++                speed = 1000;
++            } else if (pattern == "nod") {
++                steps = {{0, 16, 330}, {0, -12, 330}};
++                speed = 850;
++            } else if (pattern == "shake") {
++                steps = {{-32, 0, 320}, {32, 0, 320}};
++                speed = 900;
++            } else if (pattern == "look_around") {
++                steps = {{-70, 0, 1600}, {70, 5, 2000}, {0, 22, 1300}};
++                speed = 300;
++            } else if (pattern == "robot") {
++                steps = {{30, -10, 450}, {30, 14, 450}, {-30, 14, 450}, {-30, -10, 450}};
++                speed = 1000;
++            } else if (pattern == "custom") {
++                // "yaw,pitch,ms;yaw,pitch,ms;..."
++                const std::string text = properties["steps"].value<std::string>();
++                size_t start           = 0;
++                while (start < text.size() && steps.size() < 20) {
++                    size_t end = text.find(';', start);
++                    if (end == std::string::npos) end = text.size();
++                    int yaw = 0, pitch = 0, ms = 0;
++                    if (sscanf(text.substr(start, end - start).c_str(), " %d , %d , %d", &yaw, &pitch, &ms) == 3) {
++                        steps.push_back({yaw, pitch, ms});
++                    }
++                    start = end + 1;
++                }
++                if (steps.empty()) throw std::runtime_error("custom needs steps like \"-30,0,400;30,10,400\"");
++            } else if (pattern != "stop") {
++                throw std::runtime_error("Unknown pattern: " + pattern);
++            }
++
++            mclog::tagInfo(_tag, "animate_head: {} {}s tempo {}", pattern, seconds, tempo);
++            LvglLockGuard lock;
++            auto& stackchan = GetStackChan();
++            if (loop_id >= 0) {
++                stackchan.removeModifier(loop_id);
++                loop_id = -1;
++            }
++            if (pattern != "stop") {
++                loop_id = stackchan.addModifier(
++                    std::make_unique<HeadLoopModifier>(std::move(steps), seconds * 1000, tempo, speed));
 +            }
 +            return true;
 +        });
@@ -1051,3 +1138,84 @@ index 32c6c1f..0e1a5d5 100644
              break;
          default:
              break;
+diff --git a/firmware/main/stackchan/modifiers/head_loop.h b/firmware/main/stackchan/modifiers/head_loop.h
+new file mode 100644
+index 0000000..ed78a14
+--- /dev/null
++++ b/firmware/main/stackchan/modifiers/head_loop.h
+@@ -0,0 +1,75 @@
++/*
++ * Kit: head dances and gestures (sway, nod, ...), looping for a set time.
++ *
++ * Each pattern is a few far-apart points; every point is sent to the servos
++ * once and their spring animation swings the head there (the way the idle
++ * motion moves). Re-targeting more often would make it worse: every new
++ * target restarts the spring from standstill (Servo::update_angle_anim_target).
++ * Only the servos move: the face and the LEDs stay with their own tools.
++ */
++#pragma once
++#include "../modifiable.h"
++#include <hal/hal.h>
++#include <algorithm>
++#include <cmath>
++#include <vector>
++
++namespace stackchan {
++
++struct HeadStep {
++    int yaw;      // degrees from the centre, negative = the robot's left
++    int pitch;    // degrees from the centre, positive = up
++    int hold_ms;  // until the next point
++};
++
++class HeadLoopModifier : public Modifier {
++public:
++    // steps loop until duration_ms is up; tempo 2 = twice as fast; speed 100-1000 (servo spring).
++    HeadLoopModifier(std::vector<HeadStep> steps, int duration_ms, float tempo, int speed)
++        : _steps(std::move(steps)), _duration_ms(duration_ms), _tempo(std::max(tempo, 0.2f)), _speed(speed)
++    {
++    }
++
++    void _update(Modifiable& stackchan) override
++    {
++        auto& motion       = stackchan.motion();
++        const uint32_t now = GetHAL().millis();
++        if (!_started) {
++            _home_yaw   = motion.yawServo().getCurrentAngle();
++            _home_pitch = motion.pitchServo().getCurrentAngle();
++            _end_ms     = now + _duration_ms;
++            _started    = true;
++        }
++        if (now < _next_ms) {
++            return;
++        }
++        if (now >= _end_ms || _steps.empty()) {
++            motion.yawServo().moveWithSpeed(_home_yaw, 500);
++            motion.pitchServo().moveWithSpeed(_home_pitch, 500);
++            requestDestroy();
++            return;
++        }
++        // Dance around where the head was looking, kept clear of the limits.
++        const int centre_yaw   = std::clamp(_home_yaw / 10, -60, 60);
++        const int centre_pitch = std::clamp(_home_pitch / 10, 25, 55);
++        const HeadStep& step   = _steps[_index];
++        _index                 = (_index + 1) % _steps.size();
++        motion.yawServo().moveWithSpeed(std::clamp(centre_yaw + step.yaw, -128, 128) * 10, _speed);
++        motion.pitchServo().moveWithSpeed(std::clamp(centre_pitch + step.pitch, 0, 90) * 10, _speed);
++        _next_ms = now + static_cast<uint32_t>(std::max(step.hold_ms, 100) / _tempo);
++    }
++
++private:
++    std::vector<HeadStep> _steps;
++    int _duration_ms;
++    float _tempo;
++    int _speed;
++    bool _started     = false;
++    int _home_yaw     = 0;
++    int _home_pitch   = 0;
++    size_t _index     = 0;
++    uint32_t _end_ms  = 0;
++    uint32_t _next_ms = 0;
++};
++
++}  // namespace stackchan

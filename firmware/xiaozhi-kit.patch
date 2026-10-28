@@ -154,10 +154,10 @@ index 9e73014..03e8573 100644
  class Theme {
 diff --git a/main/protocols/local_agent_protocol.cc b/main/protocols/local_agent_protocol.cc
 new file mode 100644
-index 0000000..13c37ae
+index 0000000..7174168
 --- /dev/null
 +++ b/main/protocols/local_agent_protocol.cc
-@@ -0,0 +1,912 @@
+@@ -0,0 +1,923 @@
 +#include "local_agent_protocol.h"
 +
 +#include <sdkconfig.h>
@@ -383,9 +383,20 @@ index 0000000..13c37ae
 +    return Trim(out);
 +}
 +
++// cJSON makes thousands of small allocations for each model request (tool
++// definitions, history, the reply). The default allocator keeps anything under
++// 512 bytes in internal RAM, which TLS and Wi-Fi need; put cJSON in PSRAM.
++void* PsramMalloc(size_t size) {
++    void* p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
++    return p ? p : malloc(size);
++}
++
 +}  // namespace
 +
 +LocalAgentProtocol::LocalAgentProtocol() {
++    // Process-wide, and safe to switch at any time: free() handles both heaps.
++    cJSON_Hooks hooks = {PsramMalloc, free};
++    cJSON_InitHooks(&hooks);
 +    LoadSettings();
 +    jobs_ = xQueueCreate(4, sizeof(std::function<void()>*));
 +    // TLS and JSON need a roomy stack; keep it in PSRAM to spare internal RAM.

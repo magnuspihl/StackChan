@@ -46,7 +46,8 @@ docker run --rm \
         "$SERVER_IP" > sdkconfig.defaults.local
     else
       # No server: nothing to ask for updates either. API settings come from the flasher.
-      printf "CONFIG_OTA_URL=\"http://127.0.0.1:9/\"\nCONFIG_STACKCHAN_SERVER_URL=\"http://127.0.0.1:9\"\nCONFIG_KIT_LOCAL_AGENT=y\n" \
+      # Software AES: hardware AES needs a DMA buffer in scarce internal RAM per TLS record.
+      printf "CONFIG_OTA_URL=\"http://127.0.0.1:9/\"\nCONFIG_STACKCHAN_SERVER_URL=\"http://127.0.0.1:9\"\nCONFIG_KIT_LOCAL_AGENT=y\n# CONFIG_MBEDTLS_HARDWARE_AES is not set\n" \
         > sdkconfig.defaults.local
     fi
 
