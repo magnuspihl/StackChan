@@ -1,5 +1,143 @@
+diff --git a/firmware/main/CMakeLists.txt b/firmware/main/CMakeLists.txt
+index 3680c68..bd079a0 100644
+--- a/firmware/main/CMakeLists.txt
++++ b/firmware/main/CMakeLists.txt
+@@ -51,6 +51,7 @@ set(SOURCES "audio/audio_codec.cc"
+             "protocols/protocol.cc"
+             "protocols/mqtt_protocol.cc"
+             "protocols/websocket_protocol.cc"
++            "protocols/local_agent_protocol.cc"
+             "mcp_server.cc"
+             "system_info.cc"
+             "application.cc"
+diff --git a/firmware/main/Kconfig.projbuild b/firmware/main/Kconfig.projbuild
+index c8760d4..c818f0e 100644
+--- a/firmware/main/Kconfig.projbuild
++++ b/firmware/main/Kconfig.projbuild
+@@ -1005,3 +1005,77 @@ menu "BLE prph Configuration"
+             Use this option to enable resolving peer's address.
+ 
+ endmenu
++
++menu "StackChan Kit: on-device agent"
++
++config KIT_LOCAL_AGENT
++    bool "Run the agent on the robot (no voice server)"
++    default n
++    help
++        Call speech-to-text, the LLM and text-to-speech directly over HTTPS
++        instead of streaming to a xiaozhi-compatible voice server.
++
++config KIT_LLM_BASE_URL
++    string "LLM API base URL (OpenAI-compatible; /chat/completions is appended)"
++    depends on KIT_LOCAL_AGENT
++    default "https://api.openai.com/v1"
++
++config KIT_LLM_KEY
++    string "LLM API key"
++    depends on KIT_LOCAL_AGENT
++    default ""
++
++config KIT_LLM_MODEL
++    string "LLM model"
++    depends on KIT_LOCAL_AGENT
++    default "gpt-4.1-mini"
++
++config KIT_TTS_BASE_URL
++    string "Text-to-speech API base URL (/audio/speech is appended)"
++    depends on KIT_LOCAL_AGENT
++    default "https://api.openai.com/v1"
++    help
++        Must return raw 24 kHz 16-bit mono PCM for response_format "pcm",
++        as OpenAI and speaches (Kokoro) do.
++
++config KIT_TTS_KEY
++    string "Text-to-speech API key (empty: no Authorization header)"
++    depends on KIT_LOCAL_AGENT
++    default ""
++
++config KIT_TTS_MODEL
++    string "Text-to-speech model"
++    depends on KIT_LOCAL_AGENT
++    default "gpt-4o-mini-tts"
++
++config KIT_TTS_VOICE
++    string "Text-to-speech voice"
++    depends on KIT_LOCAL_AGENT
++    default "coral"
++
++config KIT_REPLY_LANGUAGE
++    string "Language the robot answers in (e.g. English, Danish)"
++    depends on KIT_LOCAL_AGENT
++    default "English"
++
++config KIT_STT_BASE_URL
++    string "Speech-to-text API base URL (/audio/transcriptions is appended)"
++    depends on KIT_LOCAL_AGENT
++    default "https://api.openai.com/v1"
++
++config KIT_STT_KEY
++    string "Speech-to-text API key (empty: no Authorization header)"
++    depends on KIT_LOCAL_AGENT
++    default ""
++
++config KIT_STT_MODEL
++    string "Speech-to-text model"
++    depends on KIT_LOCAL_AGENT
++    default "gpt-4o-mini-transcribe"
++
++config KIT_STT_LANGUAGE
++    string "Speech language (ISO 639-1, empty = auto-detect)"
++    depends on KIT_LOCAL_AGENT
++    default "en"
++
++endmenu
+diff --git a/firmware/main/hal/board/stackchan_camera.cc b/firmware/main/hal/board/stackchan_camera.cc
+index 5ae1912..4bc5603 100644
+--- a/firmware/main/hal/board/stackchan_camera.cc
++++ b/firmware/main/hal/board/stackchan_camera.cc
+@@ -1024,6 +1024,27 @@ bool StackChanCamera::SetVFlip(bool enabled)
+  * @note 函数会等待之前的编码线程完成后再开始新的处理
+  * @warning 如果摄像头缓冲区为空或网络连接失败，将返回错误信息
+  */
++bool StackChanCamera::GetJpeg(std::string& jpeg)
++{
++    // Kit: encode synchronously into one buffer (PSRAM) for the on-device agent.
++    jpeg.clear();
++    if (frame_.data == nullptr) {
++        return false;
++    }
++    uint16_t w = frame_.width ? frame_.width : 320;
++    uint16_t h = frame_.height ? frame_.height : 240;
++    bool ok    = image_to_jpeg_cb(
++        frame_.data, frame_.len, w, h, frame_.format, 80,
++        [](void* arg, size_t index, const void* data, size_t len) -> size_t {
++            if (index == 0 && data != nullptr && len > 0) {
++                static_cast<std::string*>(arg)->append(static_cast<const char*>(data), len);
++            }
++            return len;
++        },
++        &jpeg);
++    return ok && !jpeg.empty();
++}
++
+ std::string StackChanCamera::Explain(const std::string& question)
+ {
+     if (explain_url_.empty()) {
+diff --git a/firmware/main/hal/board/stackchan_camera.h b/firmware/main/hal/board/stackchan_camera.h
+index 1f80c1f..c28a71f 100644
+--- a/firmware/main/hal/board/stackchan_camera.h
++++ b/firmware/main/hal/board/stackchan_camera.h
+@@ -56,6 +56,7 @@ public:
+     virtual bool SetHMirror(bool enabled) override;
+     virtual bool SetVFlip(bool enabled) override;
+     virtual std::string Explain(const std::string& question);
++    virtual bool GetJpeg(std::string& jpeg) override;
+ 
+     const uint8_t* GetFrameData()
+     {
 diff --git a/firmware/main/hal/board/stackchan_display.cc b/firmware/main/hal/board/stackchan_display.cc
-index 7459888..d1c8f36 100644
+index 7459888..186172c 100644
 --- a/firmware/main/hal/board/stackchan_display.cc
 +++ b/firmware/main/hal/board/stackchan_display.cc
 @@ -18,6 +18,9 @@
@@ -12,7 +150,7 @@ index 7459888..d1c8f36 100644
  using namespace stackchan;
  using namespace stackchan::avatar;
  
-@@ -326,30 +329,67 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
+@@ -326,30 +329,70 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
          return;
      }
  
@@ -86,10 +224,13 @@ index 7459888..d1c8f36 100644
 +        avatar.setSpeech(kSleepSpeech);
          is_sleeping_ = true;
 -        // avatar.mouth().setWeight(10);
++        // Kit: asleep means dark, whatever the LEDs showed before.
++        stackchan.leftNeonLight().off();
++        stackchan.rightNeonLight().off();
  
          // Stop idle motion
          ESP_LOGW(TAG, "Stop idle motion");
-@@ -363,9 +403,6 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
+@@ -363,9 +406,6 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
          // Return to default pose
          auto& motion = GetStackChan().motion();
          motion.pitchServo().moveWithSpeed(0, 80);
@@ -99,7 +240,7 @@ index 7459888..d1c8f36 100644
      } else {
          ESP_LOGW(TAG, "Unknown emotion: %s, using NEUTRAL", emotion);
          avatar.setEmotion(Emotion::Neutral);
-@@ -410,6 +447,10 @@ void StackChanAvatarDisplay::ClearChatMessages()
+@@ -410,6 +450,10 @@ void StackChanAvatarDisplay::ClearChatMessages()
      DisplayLockGuard lock(this);
  
      stackchan.avatar().clearSpeech();
@@ -110,7 +251,36 @@ index 7459888..d1c8f36 100644
  
      ESP_LOGI(TAG, "Chat messages cleared");
  }
-@@ -532,7 +573,11 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
+@@ -503,8 +547,7 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
+             speaking_modifier_id_ = -1;
+         }
+ 
+-        GetHAL().setRgbColor(0, 0, 50, 0);
+-        GetHAL().refreshRgb();
++        SetStatusDot(true, 0x00C853);  // Kit: green = live mic
+ 
+     } else if (strcmp(status, Lang::Strings::STANDBY) == 0) {
+         _is_xiaozhi_ready = true;
+@@ -518,21 +561,26 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
+ 
+         is_idle = true;
+ 
+-        GetHAL().setRgbColor(0, 0, 0, 0);
+-        GetHAL().refreshRgb();
++        SetStatusDot(false);
+ 
+     } else if (strcmp(status, Lang::Strings::SPEAKING) == 0) {
+         if (speaking_modifier_id_ < 0) {
+             speaking_modifier_id_ = stackchan.addModifier(std::make_unique<SpeakingModifier>(0, 180, false));
+         }
+ 
+-        GetHAL().setRgbColor(0, 0, 0, 50);
+-        GetHAL().refreshRgb();
++        SetStatusDot(true, 0x2979FF);
++    } else if (strcmp(status, KIT_STATUS_THINKING) == 0) {
++        // Kit: the on-device agent heard the end of the utterance and is working on it.
++        SetStatusDot(true, 0x2979FF, true);
+     } else {
          avatar.setSpeech(status);
      }
  
@@ -123,7 +293,7 @@ index 7459888..d1c8f36 100644
          // Start idle motion
          ESP_LOGW(TAG, "Start idle motion");
          if (idle_motion_modifier_id_ < 0) {
-@@ -562,9 +607,13 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
+@@ -562,9 +610,51 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
          _is_xiaozhi_idle = false;
      }
  
@@ -136,10 +306,738 @@ index 7459888..d1c8f36 100644
 +        is_sleeping_ = false;
          avatar.setSpeech("");
 +        avatar.setEmotion(Emotion::Neutral);
++    }
++}
++
++void StackChanAvatarDisplay::SetStatusDot(bool visible, uint32_t color, bool breathe)
++{
++    // Caller holds the display lock. The dot lives on the avatar's screen, which
++    // other apps replace, so re-create it if LVGL has deleted it.
++    if (status_dot_ == nullptr || !lv_obj_is_valid(status_dot_)) {
++        status_dot_ = lv_obj_create(lv_screen_active());
++        lv_obj_remove_style_all(status_dot_);
++        lv_obj_set_size(status_dot_, 14, 14);
++        lv_obj_set_style_radius(status_dot_, LV_RADIUS_CIRCLE, 0);
++        lv_obj_set_style_bg_opa(status_dot_, LV_OPA_COVER, 0);
++        lv_obj_align(status_dot_, LV_ALIGN_TOP_RIGHT, -12, 12);
++        lv_obj_remove_flag(status_dot_, LV_OBJ_FLAG_CLICKABLE);
++    }
++    lv_anim_delete(status_dot_, nullptr);
++    lv_obj_set_style_opa(status_dot_, LV_OPA_COVER, 0);
++    if (!visible) {
++        lv_obj_add_flag(status_dot_, LV_OBJ_FLAG_HIDDEN);
++        return;
++    }
++    lv_obj_remove_flag(status_dot_, LV_OBJ_FLAG_HIDDEN);
++    lv_obj_set_style_bg_color(status_dot_, lv_color_hex(color), 0);
++    lv_obj_move_foreground(status_dot_);
++    if (breathe) {
++        lv_anim_t a;
++        lv_anim_init(&a);
++        lv_anim_set_var(&a, status_dot_);
++        lv_anim_set_values(&a, LV_OPA_20, LV_OPA_COVER);
++        lv_anim_set_duration(&a, 800);
++        lv_anim_set_reverse_duration(&a, 800);
++        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
++        lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
++        lv_anim_set_exec_cb(&a, [](void* obj, int32_t v) {
++            lv_obj_set_style_opa(static_cast<lv_obj_t*>(obj), static_cast<lv_opa_t>(v), 0);
++        });
++        lv_anim_start(&a);
      }
  }
  
+diff --git a/firmware/main/hal/board/stackchan_display.h b/firmware/main/hal/board/stackchan_display.h
+index f16f1f3..10fd330 100644
+--- a/firmware/main/hal/board/stackchan_display.h
++++ b/firmware/main/hal/board/stackchan_display.h
+@@ -19,6 +19,10 @@ private:
+     int idle_expression_modifier_id_    = -1;
+     int blink_modifier_id_              = -1;
+     bool is_sleeping_                   = false;
++    // Kit: status dot in the top right corner (green = live mic, breathing blue =
++    // thinking, blue = speaking). The LEDs are left to the model.
++    lv_obj_t* status_dot_ = nullptr;
++    void SetStatusDot(bool visible, uint32_t color = 0, bool breathe = false);
+     uint8_t idle_motion_level_          = 2;
+ 
+     lv_obj_t* preview_image_                         = nullptr;
+diff --git a/firmware/main/hal/hal_mcp.cpp b/firmware/main/hal/hal_mcp.cpp
+index 0d73851..c257f65 100644
+--- a/firmware/main/hal/hal_mcp.cpp
++++ b/firmware/main/hal/hal_mcp.cpp
+@@ -4,6 +4,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ #include "hal.h"
++#include <algorithm>
++#include <stdexcept>
+ #include <mooncake_log.h>
+ #include <mcp_server.h>
+ #include <stackchan/stackchan.h>
+@@ -72,8 +74,9 @@ void Hal::xiaozhi_mcp_init()
+     mclog::tagInfo(_tag, "add robot.set_led_color tool");
+     mcp_server.AddTool(
+         "self.robot.set_led_color",
+-        "Set the color of the robot's INTERNAL onboard LED. This is NOT for room lights. "
+-        "Values: 0-168 (safe range). Red=168,0,0; Green=0,168,0; Blue=0,0,168; White=100,100,100; Off=0,0,0.",
++        "Set all of the robot's own LEDs (two strips of 6, left and right) to one solid colour. This is NOT for "
++        "room lights. Values: 0-168 (safe range). Red=168,0,0; Green=0,168,0; Blue=0,0,168; White=100,100,100; "
++        "Off=0,0,0.",
+         PropertyList({Property("red", kPropertyTypeInteger, 0, 0, 168),
+                       Property("green", kPropertyTypeInteger, 0, 0, 168),
+                       Property("blue", kPropertyTypeInteger, 0, 0, 168)}),
+@@ -92,6 +95,91 @@ void Hal::xiaozhi_mcp_init()
+             return true;
+         });
+ 
++    // Kit: animated effects and per-LED colours.
++    mclog::tagInfo(_tag, "add robot.set_led_effect tool");
++    mcp_server.AddTool(
++        "self.robot.set_led_effect",
++        "Run an animated effect on the robot's own LEDs (both strips). Effects: breathe (slow fade in and out), "
++        "blink (on/off), chase (a light running along each strip), rainbow (cycling colours; ignores the colour), "
++        "solid, off. Colour values 0-168. period_ms is one cycle: 2000 is calm, 500 is fast. The effect runs "
++        "until the LEDs are changed again.",
++        PropertyList({Property("effect", kPropertyTypeString, std::string("breathe")),
++                      Property("red", kPropertyTypeInteger, 0, 0, 168),
++                      Property("green", kPropertyTypeInteger, 0, 0, 168),
++                      Property("blue", kPropertyTypeInteger, 100, 0, 168),
++                      Property("period_ms", kPropertyTypeInteger, 2000, 100, 20000)}),
++        [this](const PropertyList& properties) -> ReturnValue {
++            const std::string name = properties["effect"].value<std::string>();
++            const uitk::color::Rgb_t color(properties["red"].value<int>(), properties["green"].value<int>(),
++                                           properties["blue"].value<int>());
++            const int period = properties["period_ms"].value<int>();
++
++            addon::LightEffect effect;
++            if (name == "breathe" || name == "pulse") {
++                effect = addon::LightEffect::Breathe;
++            } else if (name == "blink") {
++                effect = addon::LightEffect::Blink;
++            } else if (name == "chase") {
++                effect = addon::LightEffect::Chase;
++            } else if (name == "rainbow") {
++                effect = addon::LightEffect::Rainbow;
++            } else if (name == "solid") {
++                effect = addon::LightEffect::Solid;
++            } else if (name == "off") {
++                effect = addon::LightEffect::Solid;
++            } else {
++                throw std::runtime_error("Unknown effect: " + name);
++            }
++            const uitk::color::Rgb_t used = name == "off" ? uitk::color::Rgb_t() : color;
++
++            mclog::tagInfo(_tag, "set_led_effect: {} r={} g={} b={} period={}", name, used.r, used.g, used.b, period);
++
++            LvglLockGuard lock;
++            GetStackChan().leftNeonLight().setEffect(effect, used, period);
++            GetStackChan().rightNeonLight().setEffect(effect, used, period);
++            return true;
++        });
++
++    mclog::tagInfo(_tag, "add robot.set_leds tool");
++    mcp_server.AddTool(
++        "self.robot.set_leds",
++        "Set the robot's 12 LEDs individually. `colors` is a comma-separated list of hex colours RRGGBB in order: "
++        "left strip LEDs 1-6, then right strip LEDs 1-6. Use - to leave an LED unchanged; a shorter list leaves "
++        "the rest unchanged. Each channel is capped at A8 (168). Example, left red and right blue: "
++        "a80000,a80000,a80000,a80000,a80000,a80000,0000a8,0000a8,0000a8,0000a8,0000a8,0000a8",
++        PropertyList({Property("colors", kPropertyTypeString)}),
++        [this](const PropertyList& properties) -> ReturnValue {
++            const std::string colors = properties["colors"].value<std::string>();
++            mclog::tagInfo(_tag, "set_leds: {}", colors);
++
++            LvglLockGuard lock;
++            int index    = 0;
++            size_t start = 0;
++            while (start <= colors.size() && index < 12) {
++                size_t end = colors.find(',', start);
++                if (end == std::string::npos) {
++                    end = colors.size();
++                }
++                std::string item = colors.substr(start, end - start);
++                item.erase(std::remove_if(item.begin(), item.end(), [](char c) { return c == ' ' || c == '#'; }),
++                           item.end());
++                if (!item.empty() && item != "-") {
++                    if (item.size() != 6 || item.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
++                        throw std::runtime_error("Invalid colour: " + item);
++                    }
++                    const uint32_t hex = std::stoul(item, nullptr, 16);
++                    const uitk::color::Rgb_t rgb(std::min<uint32_t>((hex >> 16) & 0xFF, 168),
++                                                 std::min<uint32_t>((hex >> 8) & 0xFF, 168),
++                                                 std::min<uint32_t>(hex & 0xFF, 168));
++                    auto& strip = index < 6 ? GetStackChan().leftNeonLight() : GetStackChan().rightNeonLight();
++                    strip.setPixel(index % 6, rgb);
++                }
++                index++;
++                start = end + 1;
++            }
++            return true;
++        });
++
+     mclog::tagInfo(_tag, "add robot.create_reminder tool");
+     mcp_server.AddTool("self.robot.create_reminder",
+                        "Create a reminder. Duration is in seconds. Message is what to say when time is up. Set repeat "
+diff --git a/firmware/main/hal/kit_serial_config.cpp b/firmware/main/hal/kit_serial_config.cpp
+new file mode 100644
+index 0000000..8b0990f
+--- /dev/null
++++ b/firmware/main/hal/kit_serial_config.cpp
+@@ -0,0 +1,248 @@
++/*
++ * Kit: settings over USB, for the web flasher.
++ *
++ * The flasher page writes one command per line on the USB serial port:
++ *   KIT {"cmd":"info"}
++ *   KIT {"cmd":"set","values":{"llm_key":"...","llm_model":"..."}}   ("" resets a key to its default)
++ *   KIT {"cmd":"wifi","ssid":"...","password":"..."}
++ *   KIT {"cmd":"boot_ai","on":true}   (start straight in the AI Agent)
++ *   KIT {"cmd":"reboot"}
++ * and the robot answers with one line: KIT-REPLY {"ok":true,...} or KIT-REPLY {"ok":false,"error":"..."}.
++ * Secrets are never sent back; "info" only says whether a key is set.
++ * Nothing is reachable over the network: this only exists on the USB cable.
++ */
++#include "kit_serial_config.h"
++
++#include <cJSON.h>
++#include <driver/usb_serial_jtag.h>
++#include <esp_app_desc.h>
++#include <esp_log.h>
++#include <esp_system.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++#include <ssid_manager.h>
++
++#include <cstring>
++#include <string>
++
++#include "hal.h"
++#include "settings.h"
++#include "system_info.h"
++
++#if CONFIG_KIT_LOCAL_AGENT
++
++namespace {
++
++constexpr const char* kTag       = "KitSerial";
++constexpr size_t kMaxLineLength  = 8192;  // a custom prompt fits comfortably
++constexpr const char* kPrefix    = "KIT ";
++
++struct KitKey {
++    const char* name;
++    bool secret;
++};
++// The NVS keys LocalAgentProtocol::LoadSettings reads (namespace "kit").
++constexpr KitKey kKeys[] = {
++    {"llm_url", false},   {"llm_key", true},    {"llm_model", false}, {"tts_url", false},
++    {"tts_key", true},    {"tts_model", false}, {"tts_voice", false}, {"stt_url", false},
++    {"stt_key", true},    {"stt_model", false}, {"stt_lang", false},  {"reply_lang", false},
++    {"persona", false},   {"prompt", false},
++};
++
++const KitKey* FindKey(const char* name)
++{
++    for (const auto& key : kKeys) {
++        if (strcmp(key.name, name) == 0) {
++            return &key;
++        }
++    }
++    return nullptr;
++}
++
++void Reply(cJSON* reply)
++{
++    char* printed    = cJSON_PrintUnformatted(reply);
++    std::string line = std::string("\nKIT-REPLY ") + (printed ? printed : "{}") + "\n";
++    cJSON_free(printed);
++    cJSON_Delete(reply);
++    usb_serial_jtag_write_bytes(line.data(), line.size(), pdMS_TO_TICKS(1000));
++}
++
++void ReplyError(const std::string& error)
++{
++    cJSON* reply = cJSON_CreateObject();
++    cJSON_AddBoolToObject(reply, "ok", false);
++    cJSON_AddStringToObject(reply, "error", error.c_str());
++    Reply(reply);
++}
++
++void HandleInfo()
++{
++    cJSON* reply = cJSON_CreateObject();
++    cJSON_AddBoolToObject(reply, "ok", true);
++    cJSON_AddStringToObject(reply, "firmware", esp_app_get_description()->version);
++    cJSON_AddStringToObject(reply, "mac", SystemInfo::GetMacAddress().c_str());
++
++    // Only what is stored on the robot; empty means the build default applies.
++    Settings nvs("kit", false);
++    cJSON* settings = cJSON_AddObjectToObject(reply, "settings");
++    for (const auto& key : kKeys) {
++        const std::string value = nvs.GetString(key.name, "");
++        if (key.secret) {
++            cJSON_AddBoolToObject(settings, key.name, !value.empty());
++        } else {
++            cJSON_AddStringToObject(settings, key.name, value.c_str());
++        }
++    }
++
++    cJSON_AddBoolToObject(reply, "boot_ai", GetHAL().getXiaozhiConfig().startAiAgentOnBoot);
++
++    cJSON* wifi = cJSON_AddArrayToObject(reply, "wifi");
++    for (const auto& item : SsidManager::GetInstance().GetSsidList()) {
++        cJSON_AddItemToArray(wifi, cJSON_CreateString(item.ssid.c_str()));
++    }
++    Reply(reply);
++}
++
++void HandleSet(cJSON* values)
++{
++    if (!cJSON_IsObject(values)) {
++        ReplyError("set needs a \"values\" object");
++        return;
++    }
++    // Validate everything before writing anything.
++    cJSON* item = nullptr;
++    cJSON_ArrayForEach(item, values)
++    {
++        if (!FindKey(item->string)) {
++            ReplyError(std::string("unknown setting: ") + item->string);
++            return;
++        }
++        if (!cJSON_IsString(item)) {
++            ReplyError(std::string("not a string: ") + item->string);
++            return;
++        }
++    }
++    Settings nvs("kit", true);
++    int changed = 0;
++    cJSON_ArrayForEach(item, values)
++    {
++        if (item->valuestring[0] == '\0') {
++            nvs.EraseKey(item->string);
++        } else {
++            nvs.SetString(item->string, item->valuestring);
++        }
++        changed++;
++    }
++    ESP_LOGI(kTag, "Saved %d setting(s)", changed);
++    cJSON* reply = cJSON_CreateObject();
++    cJSON_AddBoolToObject(reply, "ok", true);
++    cJSON_AddNumberToObject(reply, "changed", changed);
++    Reply(reply);
++}
++
++void HandleWifi(cJSON* root)
++{
++    cJSON* ssid     = cJSON_GetObjectItem(root, "ssid");
++    cJSON* password = cJSON_GetObjectItem(root, "password");
++    if (!cJSON_IsString(ssid) || ssid->valuestring[0] == '\0' || strlen(ssid->valuestring) > 32) {
++        ReplyError("wifi needs an ssid (1-32 characters)");
++        return;
++    }
++    const std::string pass = cJSON_IsString(password) ? password->valuestring : "";
++    if (!pass.empty() && (pass.size() < 8 || pass.size() > 64)) {
++        ReplyError("a Wi-Fi password is 8-64 characters");
++        return;
++    }
++    // The same store the StackChan app's Bluetooth setup writes to.
++    SsidManager::GetInstance().AddSsid(ssid->valuestring, pass);
++    ESP_LOGI(kTag, "Saved Wi-Fi network %s", ssid->valuestring);
++    cJSON* reply = cJSON_CreateObject();
++    cJSON_AddBoolToObject(reply, "ok", true);
++    Reply(reply);
++}
++
++void HandleLine(const std::string& line)
++{
++    if (line.rfind(kPrefix, 0) != 0) {
++        return;  // not for us
++    }
++    cJSON* root = cJSON_Parse(line.c_str() + strlen(kPrefix));
++    cJSON* cmd  = cJSON_GetObjectItem(root, "cmd");
++    if (!cJSON_IsString(cmd)) {
++        ReplyError("expected KIT {\"cmd\":...}");
++    } else if (strcmp(cmd->valuestring, "info") == 0) {
++        HandleInfo();
++    } else if (strcmp(cmd->valuestring, "set") == 0) {
++        HandleSet(cJSON_GetObjectItem(root, "values"));
++    } else if (strcmp(cmd->valuestring, "boot_ai") == 0) {
++        // M5's "start AI agent on boot" switch (the Setup app has the same one).
++        cJSON* on = cJSON_GetObjectItem(root, "on");
++        if (!cJSON_IsBool(on)) {
++            ReplyError("boot_ai needs \"on\": true or false");
++        } else {
++            auto config               = GetHAL().getXiaozhiConfig();
++            config.startAiAgentOnBoot = cJSON_IsTrue(on);
++            GetHAL().setXiaozhiConfig(config);
++            cJSON* reply = cJSON_CreateObject();
++            cJSON_AddBoolToObject(reply, "ok", true);
++            Reply(reply);
++        }
++    } else if (strcmp(cmd->valuestring, "wifi") == 0) {
++        HandleWifi(root);
++    } else if (strcmp(cmd->valuestring, "reboot") == 0) {
++        cJSON* reply = cJSON_CreateObject();
++        cJSON_AddBoolToObject(reply, "ok", true);
++        Reply(reply);
++        vTaskDelay(pdMS_TO_TICKS(300));
++        esp_restart();
++    } else {
++        ReplyError(std::string("unknown command: ") + cmd->valuestring);
++    }
++    cJSON_Delete(root);
++}
++
++void SerialTask(void*)
++{
++    std::string line;
++    uint8_t buffer[128];
++    while (true) {
++        const int n = usb_serial_jtag_read_bytes(buffer, sizeof(buffer), portMAX_DELAY);
++        for (int i = 0; i < n; i++) {
++            const char c = static_cast<char>(buffer[i]);
++            if (c == '\n' || c == '\r') {
++                if (!line.empty()) {
++                    HandleLine(line);
++                }
++                line.clear();
++            } else if (line.size() < kMaxLineLength) {
++                line += c;
++            }
++        }
++    }
++}
++
++}  // namespace
++
++void kit::StartSerialConfig()
++{
++    if (!usb_serial_jtag_is_driver_installed()) {
++        usb_serial_jtag_driver_config_t config = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
++        config.rx_buffer_size                  = 1024;
++        config.tx_buffer_size                  = 1024;
++        if (usb_serial_jtag_driver_install(&config) != ESP_OK) {
++            ESP_LOGE(kTag, "Cannot install the USB serial driver; settings over USB are off");
++            return;
++        }
++    }
++    xTaskCreate(SerialTask, "kit_serial", 6 * 1024, nullptr, 2, nullptr);
++    ESP_LOGI(kTag, "Listening for settings on USB");
++}
++
++#else
++
++void kit::StartSerialConfig()
++{
++}
++
++#endif
+diff --git a/firmware/main/hal/kit_serial_config.h b/firmware/main/hal/kit_serial_config.h
+new file mode 100644
+index 0000000..4954422
+--- /dev/null
++++ b/firmware/main/hal/kit_serial_config.h
+@@ -0,0 +1,9 @@
++#pragma once
++
++namespace kit {
++
++// Kit: accept settings (API keys, models, Wi-Fi) from the web flasher over USB.
++// Only active in the on-device build (CONFIG_KIT_LOCAL_AGENT).
++void StartSerialConfig();
++
++}  // namespace kit
+diff --git a/firmware/main/main.cpp b/firmware/main/main.cpp
+index 3f11ed6..f0ac928 100644
+--- a/firmware/main/main.cpp
++++ b/firmware/main/main.cpp
+@@ -3,6 +3,7 @@
+  *
+  * SPDX-License-Identifier: MIT
+  */
++#include <hal/kit_serial_config.h>
+ #include <smooth_ui_toolkit.hpp>
+ #include <uitk/short_namespace.hpp>
+ #include <mooncake_log.h>
+@@ -22,6 +23,9 @@ extern "C" void app_main(void)
+     // HAL init
+     GetHAL().init();
+ 
++    // Kit: settings and Wi-Fi from the web flasher, over USB
++    kit::StartSerialConfig();
++
+     // Setup ui hal
+     ui_hal::on_delay([](uint32_t ms) { GetHAL().delay(ms); });
+     ui_hal::on_get_tick([]() { return GetHAL().millis(); });
+@@ -36,7 +40,7 @@ extern "C" void app_main(void)
+         GetMooncake().installApp(std::make_unique<AppAvatar>());
+         GetMooncake().installApp(std::make_unique<AppEspnowControl>());
+         GetMooncake().installApp(std::make_unique<AppAppCenter>());
+-        GetMooncake().installApp(std::make_unique<AppEzdata>());
++        // Kit: no EzData app; it talks to M5Stack's cloud (ezdata2.m5stack.com).
+         GetMooncake().installApp(std::make_unique<AppDance>());
+         GetMooncake().installApp(std::make_unique<AppSetup>());
+ 
+diff --git a/firmware/main/stackchan/addons/neon_light/neon_light.cpp b/firmware/main/stackchan/addons/neon_light/neon_light.cpp
+index 512914f..e09deec 100644
+--- a/firmware/main/stackchan/addons/neon_light/neon_light.cpp
++++ b/firmware/main/stackchan/addons/neon_light/neon_light.cpp
+@@ -5,9 +5,43 @@
+  */
+ #include "neon_light.h"
+ #include <hal/hal.h>
++#include <algorithm>
++#include <cmath>
+ 
+ using namespace stackchan::addon;
+ 
++namespace {
++
++uitk::color::Rgb_t scaled(const uitk::color::Rgb_t& c, float level)
++{
++    return uitk::color::Rgb_t(c.r * level, c.g * level, c.b * level);
++}
++
++// 0..1..0 over one period, starting dark.
++float wave(uint32_t elapsed, uint32_t period)
++{
++    const float phase = static_cast<float>(elapsed % period) / period;
++    return (1.0f - std::cos(phase * 2.0f * static_cast<float>(M_PI))) / 2.0f;
++}
++
++uitk::color::Rgb_t hue_to_rgb(float hue, uint8_t value)
++{
++    const float h = std::fmod(hue, 1.0f) * 6.0f;
++    const float x = 1.0f - std::fabs(std::fmod(h, 2.0f) - 1.0f);
++    float r = 0, g = 0, b = 0;
++    switch (static_cast<int>(h)) {
++        case 0: r = 1, g = x; break;
++        case 1: r = x, g = 1; break;
++        case 2: g = 1, b = x; break;
++        case 3: g = x, b = 1; break;
++        case 4: r = x, b = 1; break;
++        default: r = 1, b = x; break;
++    }
++    return uitk::color::Rgb_t(r * value, g * value, b * value);
++}
++
++}  // namespace
++
+ void NeonLight::init()
+ {
+     // Setup color animation
+@@ -29,45 +63,91 @@ void NeonLight::update()
+     }
+     _last_tick = GetHAL().millis();
+ 
+-    // Apply color animation
+-    if (!_color_anim.done()) {
+-        _color_anim.updateWithDelta(0.02f);  // Fixed delta time for consistency
+-        for (int i = 0; i < _led_count; i++) {
+-            set_rgb_color_impl(i, _color_anim.r, _color_anim.g, _color_anim.b);
++    bool write = false;
++    if (_effect == LightEffect::Solid) {
++        // Apply color animation
++        if (!_color_anim.done()) {
++            _color_anim.updateWithDelta(0.02f);  // Fixed delta time for consistency
++            write = true;
++        }
++
++        // Snap to target angle when animation ends
++        else if (_snap_to_target_on_rest) {
++            _snap_to_target_on_rest = false;
++            write                   = true;
+         }
+-        refresh_rgb_impl();
++    } else {
++        // Kit: animated effects redraw every tick; Custom only when changed.
++        write = _effect != LightEffect::Custom;
+     }
++    write = write || _dirty;
++    if (write) {
++        _dirty = false;
++        write_pixels(_last_tick);
++    }
++}
+ 
+-    // Snap to target angle when animation ends
+-    else if (_snap_to_target_on_rest) {
+-        _snap_to_target_on_rest = false;
+-        for (int i = 0; i < _led_count; i++) {
+-            set_rgb_color_impl(i, _color_anim.r, _color_anim.g, _color_anim.b);
++uitk::color::Rgb_t NeonLight::effect_pixel(int index, uint32_t now)
++{
++    const uint32_t elapsed = now - _effect_start_ms;
++    switch (_effect) {
++        case LightEffect::Solid:
++            return uitk::color::Rgb_t(_color_anim.r, _color_anim.g, _color_anim.b);
++        case LightEffect::Breathe:
++            return scaled(_effect_color, 0.05f + 0.95f * wave(elapsed, _effect_period_ms));
++        case LightEffect::Blink:
++            return (elapsed % _effect_period_ms) < _effect_period_ms / 2 ? _effect_color : uitk::color::Rgb_t();
++        case LightEffect::Chase: {
++            // One bright LED runs along the strip with a short fading tail.
++            const int head = (elapsed % _effect_period_ms) * _led_count / _effect_period_ms;
++            const int behind = (head - index + _led_count) % _led_count;
++            const float level = behind == 0 ? 1.0f : behind == 1 ? 0.3f : behind == 2 ? 0.08f : 0.0f;
++            return scaled(_effect_color, level);
++        }
++        case LightEffect::Rainbow: {
++            const float hue = static_cast<float>(elapsed % _effect_period_ms) / _effect_period_ms +
++                              static_cast<float>(index) / _led_count;
++            return hue_to_rgb(hue, 120);
+         }
+-        refresh_rgb_impl();
++        case LightEffect::Custom:
++            return _pixels[index];
+     }
++    return {};
++}
++
++void NeonLight::write_pixels(uint32_t now)
++{
++    for (int i = 0; i < _led_count; i++) {
++        auto c = effect_pixel(i, now);
++        set_rgb_color_impl(i, c.r, c.g, c.b);
++    }
++    refresh_rgb_impl();
+ }
+ 
+ void NeonLight::setColor(uint8_t r, uint8_t g, uint8_t b)
+ {
++    _effect = LightEffect::Solid;
+     _color_anim.move(r, g, b);
+     _snap_to_target_on_rest = true;
+ }
+ 
+ void NeonLight::setColor(const uitk::color::Rgb_t& rgb)
+ {
++    _effect = LightEffect::Solid;
+     _color_anim.move(rgb);
+     _snap_to_target_on_rest = true;
+ }
+ 
+ void NeonLight::setColor(uint32_t hex)
+ {
++    _effect = LightEffect::Solid;
+     _color_anim.move(hex);
+     _snap_to_target_on_rest = true;
+ }
+ 
+ void NeonLight::setColor(std::string_view hex)
+ {
++    _effect = LightEffect::Solid;
+     _color_anim.move(hex);
+     _snap_to_target_on_rest = true;
+ }
+@@ -78,6 +158,44 @@ void NeonLight::setDuration(float durationSec)
+     _color_anim.begin();
+ }
+ 
++void NeonLight::setEffect(LightEffect effect, const uitk::color::Rgb_t& rgb, uint32_t periodMs)
++{
++    if (effect == LightEffect::Solid) {
++        setColor(rgb);
++        return;
++    }
++    _effect           = effect;
++    _effect_color     = rgb;
++    _effect_period_ms = std::clamp<uint32_t>(periodMs, 100, 20000);
++    _effect_start_ms  = GetHAL().millis();
++    _dirty            = true;
++}
++
++void NeonLight::setPixel(int index, const uitk::color::Rgb_t& rgb)
++{
++    if (index < 0 || index >= _led_count) {
++        return;
++    }
++    if (_effect != LightEffect::Custom) {
++        // Start from what is showing now, so the other LEDs don't jump.
++        const uint32_t now = GetHAL().millis();
++        for (int i = 0; i < _led_count; i++) {
++            _pixels[i] = effect_pixel(i, now);
++        }
++        _effect = LightEffect::Custom;
++    }
++    _pixels[index] = rgb;
++    _dirty         = true;
++}
++
++void NeonLight::off()
++{
++    _effect = LightEffect::Solid;
++    _color_anim.teleport(0, 0, 0);
++    _color_anim.update();
++    _dirty = true;
++}
++
+ void LeftNeonLight::set_rgb_color_impl(uint8_t index, uint8_t r, uint8_t g, uint8_t b)
+ {
+     GetHAL().setRgbColor(index, r, g, b);
+diff --git a/firmware/main/stackchan/addons/neon_light/neon_light.h b/firmware/main/stackchan/addons/neon_light/neon_light.h
+index 5049d0a..13261f7 100644
+--- a/firmware/main/stackchan/addons/neon_light/neon_light.h
++++ b/firmware/main/stackchan/addons/neon_light/neon_light.h
+@@ -9,16 +9,20 @@
+ #include <uitk/short_namespace.hpp>
+ #include "core/color/color.hpp"
+ #include <string_view>
++#include <vector>
+ 
+ namespace stackchan::addon {
+ 
++// Kit: animated effects. Solid is the original behaviour (a short fade to the colour).
++enum class LightEffect { Solid, Breathe, Blink, Chase, Rainbow, Custom };
++
+ /**
+  * @brief
+  *
+  */
+ class NeonLight {
+ public:
+-    NeonLight(int ledCount) : _led_count(ledCount)
++    NeonLight(int ledCount) : _led_count(ledCount), _pixels(ledCount)
+     {
+     }
+ 
+@@ -35,16 +39,33 @@ public:
+         return _led_count;
+     }
+ 
++    // Kit: an animated effect in one colour (Rainbow ignores the colour).
++    void setEffect(LightEffect effect, const uitk::color::Rgb_t& rgb, uint32_t periodMs);
++    // Kit: one LED's colour; switches to Custom, keeping the other LEDs as they are.
++    void setPixel(int index, const uitk::color::Rgb_t& rgb);
++    // Kit: everything dark.
++    void off();
++
+ protected:
+     virtual void set_rgb_color_impl(uint8_t index, uint8_t r, uint8_t g, uint8_t b) = 0;
+     virtual void refresh_rgb_impl()                                                 = 0;
+ 
+ private:
++    uitk::color::Rgb_t effect_pixel(int index, uint32_t now);
++    void write_pixels(uint32_t now);
++
+     int _led_count;
+     bool _is_inited              = false;
+     bool _snap_to_target_on_rest = false;
+     uint32_t _last_tick          = 0;
+     uitk::color::AnimateRgb_t _color_anim;
++
++    LightEffect _effect = LightEffect::Solid;
++    uitk::color::Rgb_t _effect_color;
++    uint32_t _effect_period_ms = 2000;
++    uint32_t _effect_start_ms  = 0;
++    std::vector<uitk::color::Rgb_t> _pixels;  // Custom colours
++    bool _dirty = false;  // a static frame changed and needs one write
+ };
+ 
+ /**
 diff --git a/firmware/main/stackchan/avatar/skins/default/eyes.cpp b/firmware/main/stackchan/avatar/skins/default/eyes.cpp
+index 32c6c1f..0e1a5d5 100644
 --- a/firmware/main/stackchan/avatar/skins/default/eyes.cpp
 +++ b/firmware/main/stackchan/avatar/skins/default/eyes.cpp
 @@ -116,7 +116,9 @@ void DefaultEyes::setEmotion(const Emotion& emotion)

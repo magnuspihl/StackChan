@@ -1,0 +1,1237 @@
+diff --git a/main/application.cc b/main/application.cc
+index e67514b..b1ecc44 100644
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -10,6 +10,7 @@
+ #include "settings.h"
+ #include "system_info.h"
+ #include "websocket_protocol.h"
++#include "local_agent_protocol.h"
+ 
+ #include <cstring>
+ #include <esp_log.h>
+@@ -231,6 +232,9 @@ void Application::Run() {
+         }
+ 
+         if (bits & MAIN_EVENT_VAD_CHANGE) {
++            if (protocol_) {
++                protocol_->OnVoiceActivity(audio_service_.IsVoiceDetected());
++            }
+             if (GetDeviceState() == kDeviceStateListening) {
+                 auto led = Board::GetInstance().GetLed();
+                 led->OnStateChanged();
+@@ -326,10 +330,16 @@ void Application::ActivationTask() {
+     ota_ = std::make_unique<Ota>();
+ 
+     // Check for new assets version
++    // Kit: also loads the speech models (wake word, VAD), so it runs on-device too.
+     CheckAssetsVersion();
+ 
++#if CONFIG_KIT_LOCAL_AGENT
++    // Kit: no server to ask for firmware updates.
++    ota_->MarkCurrentVersionValid();
++#else
+     // Check for new firmware version
+     CheckNewVersion();
++#endif
+ 
+     // Initialize the protocol
+     InitializeProtocol();
+@@ -482,6 +492,10 @@ void Application::InitializeProtocol() {
+ 
+     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
+ 
++#if CONFIG_KIT_LOCAL_AGENT
++    // Kit: on-device agent, no voice server.
++    protocol_ = std::make_unique<LocalAgentProtocol>();
++#else
+     if (ota_->HasMqttConfig()) {
+         protocol_ = std::make_unique<MqttProtocol>();
+     } else if (ota_->HasWebsocketConfig()) {
+@@ -490,6 +504,7 @@ void Application::InitializeProtocol() {
+         ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
+         protocol_ = std::make_unique<MqttProtocol>();
+     }
++#endif
+ 
+     protocol_->OnConnected([this]() {
+         DismissAlert();
+@@ -505,6 +520,13 @@ void Application::InitializeProtocol() {
+             audio_service_.PushPacketToDecodeQueue(std::move(packet));
+         }
+     });
++
++    protocol_->OnIncomingPcm([this](std::vector<int16_t>&& pcm, int sample_rate) {
++        if (GetDeviceState() != kDeviceStateSpeaking) {
++            return false;
++        }
++        return audio_service_.PushPcmToPlaybackQueue(std::move(pcm), sample_rate);
++    });
+     
+     protocol_->OnAudioChannelOpened([this, codec, &board]() {
+         board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+diff --git a/main/audio/audio_service.cc b/main/audio/audio_service.cc
+index 350ac58..002dfe5 100644
+--- a/main/audio/audio_service.cc
++++ b/main/audio/audio_service.cc
+@@ -517,6 +517,28 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
+     return true;
+ }
+ 
++bool AudioService::PushPcmToPlaybackQueue(std::vector<int16_t>&& pcm, int sample_rate) {
++    // Kit: PCM from the on-device agent goes straight to playback, no Opus.
++    if (sample_rate != codec_->output_sample_rate()) {
++        ESP_LOGE(TAG, "PCM at %d Hz, but the speaker runs at %d Hz", sample_rate, codec_->output_sample_rate());
++        return false;
++    }
++    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
++    audio_queue_cv_.wait(lock, [this]() {
++        return service_stopped_ || audio_playback_queue_.size() < MAX_PCM_TASKS_IN_QUEUE;
++    });
++    if (service_stopped_) {
++        return false;
++    }
++    auto task = std::make_unique<AudioTask>();
++    task->type = kAudioTaskTypeDecodeToPlaybackQueue;
++    task->pcm = std::move(pcm);
++    task->timestamp = 0;
++    audio_playback_queue_.push_back(std::move(task));
++    audio_queue_cv_.notify_all();
++    return true;
++}
++
+ std::unique_ptr<AudioStreamPacket> AudioService::PopPacketFromSendQueue() {
+     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+     if (audio_send_queue_.empty()) {
+diff --git a/main/audio/audio_service.h b/main/audio/audio_service.h
+index 99db546..6835273 100644
+--- a/main/audio/audio_service.h
++++ b/main/audio/audio_service.h
+@@ -39,6 +39,8 @@
+ #define OPUS_FRAME_DURATION_MS 60
+ #define MAX_ENCODE_TASKS_IN_QUEUE 2
+ #define MAX_PLAYBACK_TASKS_IN_QUEUE 2
++// Kit: PCM from the on-device agent arrives in 200 ms chunks; buffer up to 2 s.
++#define MAX_PCM_TASKS_IN_QUEUE 10
+ #define MAX_DECODE_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
+ #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
+ #define AUDIO_TESTING_MAX_DURATION_MS 10000
+@@ -128,6 +130,8 @@ public:
+     void SetCallbacks(AudioServiceCallbacks& callbacks);
+ 
+     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
++    // Kit: blocks while the playback queue is full.
++    bool PushPcmToPlaybackQueue(std::vector<int16_t>&& pcm, int sample_rate);
+     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
+     void PlaySound(const std::string_view& sound);
+     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
+diff --git a/main/boards/common/camera.h b/main/boards/common/camera.h
+index 09a6a3e..179b7e4 100644
+--- a/main/boards/common/camera.h
++++ b/main/boards/common/camera.h
+@@ -11,6 +11,8 @@ public:
+     virtual bool SetVFlip(bool enabled) = 0;
+     virtual bool SetSwapBytes(bool enabled) { return false; }  // Optional, default no-op
+     virtual std::string Explain(const std::string& question) = 0;
++    // Kit: the last Capture() as JPEG, for the on-device agent's own vision call.
++    virtual bool GetJpeg(std::string& jpeg) { return false; }
+ };
+ 
+ #endif // CAMERA_H
+diff --git a/main/display/display.h b/main/display/display.h
+index 9e73014..03e8573 100644
+--- a/main/display/display.h
++++ b/main/display/display.h
+@@ -13,6 +13,9 @@
+ #include <esp_pm.h>
+ 
+ #include <string>
++
++// Kit: status the on-device agent shows from the end of an utterance until the reply plays.
++#define KIT_STATUS_THINKING "kit:thinking"
+ #include <chrono>
+ 
+ class Theme {
+diff --git a/main/protocols/local_agent_protocol.cc b/main/protocols/local_agent_protocol.cc
+new file mode 100644
+index 0000000..13c37ae
+--- /dev/null
++++ b/main/protocols/local_agent_protocol.cc
+@@ -0,0 +1,912 @@
++#include "local_agent_protocol.h"
++
++#include <sdkconfig.h>
++
++// Only built for the on-device kit firmware (its settings exist only then).
++#if CONFIG_KIT_LOCAL_AGENT
++
++#include "application.h"
++#include "assets/lang_config.h"
++#include "board.h"
++#include "display.h"
++#include "settings.h"
++
++#include <cJSON.h>
++#include <mbedtls/base64.h>
++#include <esp_heap_caps.h>
++#include <esp_log.h>
++#include <esp_timer.h>
++
++#include <cstring>
++#include <memory>
++
++#define TAG "LocalAgent"
++
++namespace {
++
++// Silence after speech that ends an utterance, and safety limits.
++constexpr int64_t kEndOfSpeechSilenceUs = 900 * 1000;
++constexpr int64_t kMaxUtteranceUs = 20 * 1000 * 1000;
++// Nobody spoke for this long: end the session, back to wake-word standby.
++constexpr int64_t kSessionIdleUs = 30 * 1000 * 1000;
++// Utterances shorter than this are noise; Whisper turns them into "You".
++constexpr size_t kMinUtterancePackets = 10;
++// Audio kept from before the VAD fired, so the first syllable isn't lost.
++constexpr size_t kPrerollPackets = 8;
++
++// Device mic audio: 16 kHz mono Opus, one packet per 60 ms frame.
++constexpr int kInputSampleRate = 16000;
++constexpr int kInputFrameMs = 60;
++constexpr uint32_t kOpusGranulePerFrame = 48000 / 1000 * kInputFrameMs;  // Ogg Opus counts in 48 kHz
++
++// TTS: raw 16-bit mono PCM ("pcm" in the OpenAI API), handed to the speaker in
++// 200 ms chunks once 1 s is buffered, so Wi-Fi hiccups don't become gaps.
++constexpr int kTtsSampleRate = 24000;
++constexpr size_t kTtsChunkSamples = kTtsSampleRate / 5;
++constexpr size_t kTtsPrebufferChunks = 5;
++
++// Model -> tool -> model rounds per user turn.
++constexpr int kMaxToolRounds = 4;
++// Device MCP tools the model doesn't get: firmware/asset updates, reboots and
++// Wi-Fi changes. The camera's own tool uploads to a vision server; we have our
++// own take_photo that hands the picture to the model directly.
++constexpr const char* kHiddenToolPrefixes[] = {
++    "self.camera.", "self.assets.", "self.upgrade_firmware", "self.reboot", "self.system.",
++    "self.screen.snapshot", "self.screen.preview_image",
++};
++constexpr const char* kSleepTool = "go_to_sleep";
++constexpr const char* kPhotoTool = "take_photo";
++// Photos are sent once; later requests carry this instead of the image.
++constexpr const char* kPhotoPlaceholder = "[A photo you took earlier; it is no longer attached.]";
++
++// Conversation memory: a few turns, forgotten after a quiet spell.
++constexpr size_t kMaxHistoryMessages = 20;
++constexpr int64_t kHistoryExpiryUs = 10LL * 60 * 1000 * 1000;
++
++// Who the robot is: replaceable from the flasher ("persona"). The rules below always apply.
++constexpr const char* kDefaultPersona =
++    "You are Stack-chan, a small desk robot with a round face, a camera, and a head that can pan and tilt. "
++    "You are curious, a little cheeky, and genuinely helpful.";
++constexpr const char* kRules =
++    "Speech: your words are read aloud by a speech synthesizer through a tiny speaker. Keep replies short, "
++    "one to three spoken sentences, and get straight to the point. Plain spoken text only: no markdown, lists, "
++    "code or stage directions. The user's words come from speech recognition and may contain mistakes; infer "
++    "what they meant. Don't end replies with a question, offer or suggestion; only ask when you genuinely need "
++    "the information.\n\n"
++    "Face: your face shows the FIRST emoji of your reply, so start every reply with exactly one of: "
++    "\xF0\x9F\x99\x82 friendly (default), \xF0\x9F\x98\x86 amused, \xF0\x9F\x98\xB2 surprised, "
++    "\xF0\x9F\xA4\x94 thinking or unsure, \xF0\x9F\x98\x8D delighted or affectionate, "
++    "\xF0\x9F\x98\xB3 embarrassed, \xF0\x9F\x98\x94 sad, \xF0\x9F\x98\xA0 annoyed. "
++    "Let it follow the conversation. Use no other emoji anywhere.\n\n"
++    "Body: the ONLY way to move or change anything is to call the matching tool. Never claim you moved, "
++    "looked or changed a colour unless you called the tool in this turn. When asked for several things, call "
++    "all the tools together. When asked what you can see, call take_photo and describe what is actually in "
++    "the photo. Head: pitch 0 is straight ahead, 90 is straight up, so the ceiling is pitch 85-90. "
++    "Yaw 0 is straight ahead; negative is your left. You sit on a desk below the user's face, so \"look at me\" "
++    "means yaw 0, pitch 45. Use speed 500 for normal moves and 800 when asked to be quick. When the user says "
++    "goodbye or tells you to sleep, call go_to_sleep with your goodbye.";
++
++// What Whisper hears in near-silence or noise. Never a real request.
++constexpr const char* kPhantomTranscripts[] = {
++    "you", "thanks for watching", "thank you for watching",
++    "tak fordi du så med", "tak for at se med", "tak fordi i så med",
++};
++// ...and subtitle credits it learned from video, in any length.
++constexpr const char* kPhantomPrefixes[] = {"subtitles by", "undertekster", "tekstning af"};
++
++// The few lines the robot says itself, in the reply language when it knows it.
++struct FixedLines {
++    const char* no_brain;
++    const char* goodnight;
++    const char* done;
++};
++constexpr FixedLines kEnglishLines = {"Oops, I can't reach my brain right now. Try again in a moment.",
++                                      "\xF0\x9F\x99\x82 Goodnight!", "\xF0\x9F\x99\x82 Done."};
++constexpr FixedLines kDanishLines = {"Ups, jeg kan ikke få fat i min hjerne lige nu. Prøv igen om lidt.",
++                                     "\xF0\x9F\x99\x82 Godnat!", "\xF0\x9F\x99\x82 Klaret."};
++const FixedLines& Lines(bool danish) { return danish ? kDanishLines : kEnglishLines; }
++
++// The reply's leading emoji drives the face, like the voice server's emoji map.
++struct EmojiEmotion {
++    const char* utf8;
++    const char* emotion;
++};
++constexpr EmojiEmotion kEmojiEmotions[] = {
++    {"\xF0\x9F\x99\x82", "happy"},       {"\xF0\x9F\x98\x86", "funny"},
++    {"\xF0\x9F\x98\xB2", "surprised"},   {"\xF0\x9F\xA4\x94", "thinking"},
++    {"\xF0\x9F\x98\x8D", "loving"},      {"\xF0\x9F\x98\xB3", "embarrassed"},
++    {"\xF0\x9F\x98\x94", "sad"},         {"\xF0\x9F\x98\xA0", "angry"},
++};
++
++// ---- Minimal Ogg Opus muxer (RFC 7845): one Opus packet per Ogg page. ----
++
++uint32_t OggCrc(const uint8_t* data, size_t len) {
++    static uint32_t table[256];
++    static bool ready = false;
++    if (!ready) {
++        for (uint32_t i = 0; i < 256; i++) {
++            uint32_t r = i << 24;
++            for (int j = 0; j < 8; j++) {
++                r = (r & 0x80000000u) ? (r << 1) ^ 0x04C11DB7u : (r << 1);
++            }
++            table[i] = r;
++        }
++        ready = true;
++    }
++    uint32_t crc = 0;
++    for (size_t i = 0; i < len; i++) {
++        crc = (crc << 8) ^ table[((crc >> 24) & 0xFF) ^ data[i]];
++    }
++    return crc;
++}
++
++void AppendPage(std::string& out, const uint8_t* body, size_t len, uint8_t flags, uint64_t granule,
++                uint32_t serial, uint32_t seq) {
++    std::vector<uint8_t> page;
++    page.reserve(27 + 255 + len);
++    const uint8_t header[] = {'O', 'g', 'g', 'S', 0, flags};
++    page.insert(page.end(), header, header + sizeof(header));
++    for (int i = 0; i < 8; i++) page.push_back((granule >> (8 * i)) & 0xFF);
++    for (int i = 0; i < 4; i++) page.push_back((serial >> (8 * i)) & 0xFF);
++    for (int i = 0; i < 4; i++) page.push_back((seq >> (8 * i)) & 0xFF);
++    for (int i = 0; i < 4; i++) page.push_back(0);  // CRC placeholder
++    // Lacing: runs of 255, then the remainder (a final 0 if len % 255 == 0).
++    std::vector<uint8_t> lacing(len / 255, 255);
++    lacing.push_back(len % 255);
++    page.push_back(static_cast<uint8_t>(lacing.size()));
++    page.insert(page.end(), lacing.begin(), lacing.end());
++    page.insert(page.end(), body, body + len);
++    uint32_t crc = OggCrc(page.data(), page.size());
++    for (int i = 0; i < 4; i++) page[22 + i] = (crc >> (8 * i)) & 0xFF;
++    out.append(reinterpret_cast<const char*>(page.data()), page.size());
++}
++
++std::string BuildOggOpus(const std::vector<std::vector<uint8_t>>& packets) {
++    std::string out;
++    const uint32_t serial = 0x4B495421;  // "KIT!"
++    uint32_t seq = 0;
++
++    uint8_t head[19] = {'O', 'p', 'u', 's', 'H', 'e', 'a', 'd', 1, 1};
++    const uint16_t pre_skip = 312;
++    head[10] = pre_skip & 0xFF;
++    head[11] = pre_skip >> 8;
++    for (int i = 0; i < 4; i++) head[12 + i] = (kInputSampleRate >> (8 * i)) & 0xFF;
++    // bytes 16-17 output gain = 0, byte 18 channel mapping family = 0
++    AppendPage(out, head, sizeof(head), 0x02 /* BOS */, 0, serial, seq++);
++
++    const char tags[] = "OpusTags\x09\x00\x00\x00stackchan\x00\x00\x00\x00";
++    AppendPage(out, reinterpret_cast<const uint8_t*>(tags), sizeof(tags) - 1, 0, 0, serial, seq++);
++
++    uint64_t granule = 0;
++    for (size_t i = 0; i < packets.size(); i++) {
++        granule += kOpusGranulePerFrame;
++        uint8_t flags = (i + 1 == packets.size()) ? 0x04 /* EOS */ : 0;
++        AppendPage(out, packets[i].data(), packets[i].size(), flags, granule, serial, seq++);
++    }
++    return out;
++}
++
++std::string JsonEscape(const std::string& s) {
++    cJSON* str = cJSON_CreateString(s.c_str());
++    char* printed = cJSON_PrintUnformatted(str);
++    std::string result = printed ? printed : "\"\"";
++    cJSON_free(printed);
++    cJSON_Delete(str);
++    return result;
++}
++
++std::string Trim(const std::string& s) {
++    const auto first = s.find_first_not_of(" \t\r\n");
++    const auto last = s.find_last_not_of(" \t\r\n");
++    return first == std::string::npos ? "" : s.substr(first, last - first + 1);
++}
++
++std::string JoinUrl(const std::string& base, const char* path) {
++    std::string url = base;
++    while (!url.empty() && url.back() == '/') url.pop_back();
++    return url + path;
++}
++
++// Drops emoji, pictographs and markdown emphasis, which the voice would read out.
++std::string SpeakableText(const std::string& s) {
++    std::string out;
++    for (size_t i = 0; i < s.size();) {
++        const uint8_t c = s[i];
++        const size_t len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 1;
++        uint32_t cp = len == 1 ? c : c & (0xFF >> (len + 1));
++        for (size_t j = 1; j < len && i + j < s.size(); j++) cp = (cp << 6) | (s[i + j] & 0x3F);
++        const bool drop = (cp >= 0x1F000 && cp <= 0x1FAFF) || (cp >= 0x2600 && cp <= 0x27BF) ||
++                          cp == 0xFE0F || cp == 0x200D || cp == '*' || cp == '_' || cp == '#';
++        if (!drop) out.append(s, i, len);
++        i += len;
++    }
++    return Trim(out);
++}
++
++}  // namespace
++
++LocalAgentProtocol::LocalAgentProtocol() {
++    LoadSettings();
++    jobs_ = xQueueCreate(4, sizeof(std::function<void()>*));
++    // TLS and JSON need a roomy stack; keep it in PSRAM to spare internal RAM.
++    xTaskCreatePinnedToCoreWithCaps(WorkerTask, "local_agent", 16 * 1024, this, 3, &worker_, 1,
++                                    MALLOC_CAP_SPIRAM);
++}
++
++LocalAgentProtocol::~LocalAgentProtocol() {
++    if (worker_) vTaskDelete(worker_);
++    if (jobs_) vQueueDelete(jobs_);
++}
++
++void LocalAgentProtocol::LoadSettings() {
++    // NVS namespace "kit" (written by the web flasher) overrides build defaults.
++    ::Settings nvs("kit", false);
++    settings_.llm = {nvs.GetString("llm_url", CONFIG_KIT_LLM_BASE_URL), nvs.GetString("llm_key", CONFIG_KIT_LLM_KEY),
++                     nvs.GetString("llm_model", CONFIG_KIT_LLM_MODEL)};
++    settings_.tts = {nvs.GetString("tts_url", CONFIG_KIT_TTS_BASE_URL), nvs.GetString("tts_key", CONFIG_KIT_TTS_KEY),
++                     nvs.GetString("tts_model", CONFIG_KIT_TTS_MODEL)};
++    settings_.stt = {nvs.GetString("stt_url", CONFIG_KIT_STT_BASE_URL), nvs.GetString("stt_key", CONFIG_KIT_STT_KEY),
++                     nvs.GetString("stt_model", CONFIG_KIT_STT_MODEL)};
++    settings_.tts_voice = nvs.GetString("tts_voice", CONFIG_KIT_TTS_VOICE);
++    settings_.stt_language = nvs.GetString("stt_lang", CONFIG_KIT_STT_LANGUAGE);
++    settings_.reply_language = nvs.GetString("reply_lang", CONFIG_KIT_REPLY_LANGUAGE);
++    // "prompt" replaces everything (experts only); "persona" just the character.
++    const std::string base = nvs.GetString("prompt", "");
++    settings_.prompt = (base.empty() ? nvs.GetString("persona", kDefaultPersona) + "\n\n" + kRules : base) +
++                       "\n\nLanguage: always reply in " +
++                       settings_.reply_language +
++                       ", whatever language the user speaks, unless they ask you to switch.";
++    std::string language = settings_.reply_language;
++    for (char& c : language) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
++    danish_lines_ = language.rfind("da", 0) == 0;  // "Danish", "dansk", "da"
++    ESP_LOGI(TAG, "LLM %s (%s), TTS %s (%s), STT %s (%s)", settings_.llm.base_url.c_str(),
++             settings_.llm.model.c_str(), settings_.tts.base_url.c_str(), settings_.tts.model.c_str(),
++             settings_.stt.base_url.c_str(), settings_.stt.model.c_str());
++}
++
++bool LocalAgentProtocol::Start() {
++    // Nothing to connect to up front; every turn is a set of HTTPS requests.
++    if (on_connected_) on_connected_();
++    return true;
++}
++
++bool LocalAgentProtocol::OpenAudioChannel() {
++    session_id_ = "local";
++    server_sample_rate_ = kTtsSampleRate;
++    server_frame_duration_ = 60;
++    last_incoming_time_ = std::chrono::steady_clock::now();
++    channel_open_ = true;
++    if (on_audio_channel_opened_) on_audio_channel_opened_();
++    return true;
++}
++
++void LocalAgentProtocol::CloseAudioChannel(bool send_goodbye) {
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        listening_ = false;
++        packets_.clear();
++    }
++    if (channel_open_.exchange(false) && on_audio_channel_closed_) on_audio_channel_closed_();
++}
++
++bool LocalAgentProtocol::IsAudioChannelOpened() const {
++    return channel_open_;
++}
++
++bool LocalAgentProtocol::SendText(const std::string& text) {
++    cJSON* root = cJSON_Parse(text.c_str());
++    if (!root) return false;
++    auto type = cJSON_GetObjectItem(root, "type");
++    if (cJSON_IsString(type)) {
++        if (strcmp(type->valuestring, "listen") == 0) {
++            auto state = cJSON_GetObjectItem(root, "state");
++            if (cJSON_IsString(state)) HandleListen(state->valuestring);
++        } else if (strcmp(type->valuestring, "abort") == 0) {
++            aborted_ = true;
++            std::lock_guard<std::mutex> lock(mutex_);
++            packets_.clear();
++        } else if (strcmp(type->valuestring, "mcp") == 0) {
++            // A reply from the robot's own MCP server to one of our requests.
++            auto payload = cJSON_GetObjectItem(root, "payload");
++            auto id = cJSON_GetObjectItem(payload, "id");
++            if (cJSON_IsNumber(id)) {
++                cJSON* result = cJSON_GetObjectItem(payload, "result");
++                cJSON* answer = result ? result : payload;  // errors: keep the whole object
++                char* printed = cJSON_PrintUnformatted(answer);
++                {
++                    std::lock_guard<std::mutex> lock(mcp_mutex_);
++                    mcp_replies_[id->valueint] = printed ? printed : "";
++                }
++                cJSON_free(printed);
++                mcp_cv_.notify_all();
++            }
++        }
++    }
++    cJSON_Delete(root);
++    return true;
++}
++
++void LocalAgentProtocol::HandleListen(const std::string& state) {
++    if (state == "start") {
++        aborted_ = false;
++        if (sleep_pending_.exchange(false)) {
++            // The goodbye has finished playing: sleep face, end the session.
++            ESP_LOGI(TAG, "Going to sleep");
++            EmitJson("{\"type\":\"llm\",\"emotion\":\"sleepy\"}");
++            CloseAudioChannel();
++            return;
++        }
++        ResumeListening();
++    } else if (state == "stop") {
++        std::lock_guard<std::mutex> lock(mutex_);
++        listening_ = false;
++    }
++}
++
++void LocalAgentProtocol::ResumeListening() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!channel_open_) return;
++    listening_ = true;
++    heard_voice_ = false;
++    voice_active_ = false;
++    packets_.clear();
++    listen_started_us_ = esp_timer_get_time();
++}
++
++void LocalAgentProtocol::OnVoiceActivity(bool speaking) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!listening_) return;
++    voice_active_ = speaking;
++    const int64_t now = esp_timer_get_time();
++    if (speaking) {
++        if (!heard_voice_) listen_started_us_ = now;  // the utterance clock starts at the first voice
++        heard_voice_ = true;
++    } else {
++        voice_ended_us_ = now;
++    }
++}
++
++bool LocalAgentProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
++    bool finish = false;
++    bool close = false;
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        if (!listening_) return true;
++        packets_.push_back(std::move(packet->payload));
++        const int64_t now = esp_timer_get_time();
++        if (!heard_voice_) {
++            // Before anyone speaks, keep only a short pre-roll.
++            if (packets_.size() > kPrerollPackets) packets_.erase(packets_.begin());
++            if (now - listen_started_us_ > kSessionIdleUs) {
++                listening_ = false;
++                close = true;
++            }
++        } else if (!voice_active_ && now - voice_ended_us_ > kEndOfSpeechSilenceUs) {
++            finish = true;
++        } else if (now - listen_started_us_ > kMaxUtteranceUs) {
++            finish = true;
++        }
++    }
++    if (finish) FinishUtterance();
++    if (close) {
++        ESP_LOGI(TAG, "No speech for %d s, ending the session", (int)(kSessionIdleUs / 1000000));
++        RunOnWorker([this]() { CloseAudioChannel(); });
++    }
++    return true;
++}
++
++void LocalAgentProtocol::FinishUtterance() {
++    std::vector<std::vector<uint8_t>> packets;
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        packets.swap(packets_);
++        heard_voice_ = false;
++        listening_ = false;  // paused until this turn is handled
++    }
++    ESP_LOGI(TAG, "Utterance done: %u packets (%.1f s)", (unsigned)packets.size(),
++             packets.size() * kInputFrameMs / 1000.0f);
++    // The mic is no longer live: show that at once, before the first request.
++    if (packets.size() >= kMinUtterancePackets) ShowStatus(KIT_STATUS_THINKING);
++    RunOnWorker([this, packets = std::move(packets)]() mutable { ProcessUtterance(std::move(packets)); });
++}
++
++void LocalAgentProtocol::ProcessUtterance(std::vector<std::vector<uint8_t>> packets) {
++    if (packets.size() < kMinUtterancePackets) {
++        ResumeListening();
++        return;
++    }
++    int64_t t0 = esp_timer_get_time();
++    std::string text = Transcribe(BuildOggOpus(packets));
++    ESP_LOGI(TAG, "STT %d ms: \"%s\"", (int)((esp_timer_get_time() - t0) / 1000), text.c_str());
++    std::string lower;
++    for (char c : text) {
++        if (c != '.' && c != ',' && c != '!') lower += static_cast<char>(tolower(static_cast<unsigned char>(c)));
++    }
++    bool phantom = false;
++    for (const char* p : kPhantomTranscripts) phantom = phantom || lower == p;
++    for (const char* p : kPhantomPrefixes) phantom = phantom || lower.rfind(p, 0) == 0;
++    if (text.empty() || phantom || aborted_) {
++        if (!aborted_) ShowStatus(Lang::Strings::LISTENING);  // nothing to answer: the mic is live again
++        ResumeListening();
++        return;
++    }
++    EmitJson("{\"type\":\"stt\",\"text\":" + JsonEscape(text) + "}");
++    // Show that it heard and is working on it; the LLM can take a while.
++    EmitJson("{\"type\":\"llm\",\"emotion\":\"thinking\"}");
++
++    t0 = esp_timer_get_time();
++    std::string reply = Chat(text);
++    ESP_LOGI(TAG, "LLM %d ms: \"%s\" (free internal %u, psram %u)", (int)((esp_timer_get_time() - t0) / 1000),
++             reply.c_str(), (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
++             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
++    if (aborted_) {
++        ResumeListening();
++        return;
++    }
++
++    const char* emotion = reply.empty() ? "sad" : "happy";
++    for (const auto& e : kEmojiEmotions) {
++        if (reply.compare(0, strlen(e.utf8), e.utf8) == 0) {
++            emotion = e.emotion;
++            break;
++        }
++    }
++    const std::string spoken = reply.empty() ? Lines(danish_lines_).no_brain : SpeakableText(reply);
++
++    // Switch to speaking only when there is sound: a slow voice server (or one
++    // loading its model) keeps the thinking status up instead of a silent "speaking".
++    bool announced = false;
++    auto announce = [&]() {
++        if (announced) return;
++        announced = true;
++        EmitJson("{\"type\":\"tts\",\"state\":\"start\"}");
++        EmitJson(std::string("{\"type\":\"llm\",\"emotion\":\"") + emotion + "\"}");
++        EmitJson("{\"type\":\"tts\",\"state\":\"sentence_start\",\"text\":" + JsonEscape(spoken) + "}");
++    };
++    Speak(spoken, announce);
++    announce();  // no audio came: still show the reply
++    // The app goes back to listening (and sends "listen start") once playback drains.
++    EmitJson("{\"type\":\"tts\",\"state\":\"stop\"}");
++}
++
++std::string LocalAgentProtocol::Transcribe(const std::string& ogg) {
++    const std::string boundary = "----stackchankit7MA4YWxk";
++    std::string body;
++    auto field = [&](const char* name, const std::string& value) {
++        if (value.empty()) return;
++        body += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + name + "\"\r\n\r\n" + value + "\r\n";
++    };
++    field("model", settings_.stt.model);
++    field("language", settings_.stt_language);
++    field("response_format", "json");
++    body += "--" + boundary +
++            "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"speech.ogg\"\r\n"
++            "Content-Type: audio/ogg\r\n\r\n";
++    body += ogg;
++    body += "\r\n--" + boundary + "--\r\n";
++
++    const std::string url = JoinUrl(settings_.stt.base_url, "/audio/transcriptions");
++    auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
++    // esp-ml307 frees badly if the server hangs up first (its receive task
++    // calls back into the freed client), so keep the connection open and
++    // always close it from our side.
++    http->SetKeepAlive(true);
++    http->SetTimeout(30000);
++    http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
++    if (!settings_.stt.key.empty()) http->SetHeader("Authorization", "Bearer " + settings_.stt.key);
++    http->SetContent(std::move(body));
++    if (!http->Open("POST", url)) {
++        ESP_LOGE(TAG, "STT: cannot connect to %s", url.c_str());
++        return "";
++    }
++    const int status = http->GetStatusCode();
++    std::string response = http->ReadAll();
++    http->Close();
++    if (status != 200) {
++        ESP_LOGE(TAG, "STT HTTP %d: %.200s", status, response.c_str());
++        return "";
++    }
++    std::string text;
++    if (cJSON* root = cJSON_Parse(response.c_str())) {
++        auto t = cJSON_GetObjectItem(root, "text");
++        if (cJSON_IsString(t)) text = t->valuestring;
++        cJSON_Delete(root);
++    }
++    return Trim(text);  // Whisper likes to add whitespace
++}
++
++std::string LocalAgentProtocol::PostJson(const Endpoint& endpoint, const char* path, std::string body,
++                                         int timeout_ms) {
++    const std::string url = JoinUrl(endpoint.base_url, path);
++    auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
++    // esp-ml307 frees badly if the server hangs up first (its receive task
++    // calls back into the freed client), so keep the connection open and
++    // always close it from our side.
++    http->SetKeepAlive(true);
++    http->SetTimeout(timeout_ms);
++    http->SetHeader("Content-Type", "application/json");
++    if (!endpoint.key.empty()) http->SetHeader("Authorization", "Bearer " + endpoint.key);
++    http->SetContent(std::move(body));
++    if (!http->Open("POST", url)) {
++        ESP_LOGE(TAG, "Cannot connect to %s", url.c_str());
++        return "";
++    }
++    const int status = http->GetStatusCode();
++    std::string response = http->ReadAll();
++    http->Close();
++    if (status != 200) {
++        ESP_LOGE(TAG, "%s: HTTP %d: %.300s", path, status, response.c_str());
++        return "";
++    }
++    return response;
++}
++
++std::string LocalAgentProtocol::McpRequest(const std::string& method, const std::string& params_json,
++                                           int timeout_ms) {
++    int id;
++    {
++        std::lock_guard<std::mutex> lock(mcp_mutex_);
++        id = next_mcp_id_++;
++    }
++    EmitJson("{\"type\":\"mcp\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(id) +
++             ",\"method\":" + JsonEscape(method) + ",\"params\":" + params_json + "}}");
++    std::unique_lock<std::mutex> lock(mcp_mutex_);
++    if (!mcp_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
++                          [this, id]() { return mcp_replies_.count(id) > 0; })) {
++        ESP_LOGW(TAG, "MCP %s: no reply", method.c_str());
++        return "";
++    }
++    std::string reply = std::move(mcp_replies_[id]);
++    mcp_replies_.erase(id);
++    return reply;
++}
++
++void LocalAgentProtocol::LoadTools() {
++    McpRequest("initialize", "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{}}");
++    cJSON* tools = cJSON_CreateArray();
++    tool_names_.clear();
++    std::string cursor;
++    do {
++        const std::string params = cursor.empty() ? "{}" : "{\"cursor\":" + JsonEscape(cursor) + "}";
++        cJSON* result = cJSON_Parse(McpRequest("tools/list", params).c_str());
++        cursor.clear();
++        if (!result) break;
++        cJSON* list = cJSON_GetObjectItem(result, "tools");
++        cJSON* tool = nullptr;
++        cJSON_ArrayForEach(tool, list) {
++            cJSON* name = cJSON_GetObjectItem(tool, "name");
++            if (!cJSON_IsString(name)) continue;
++            const std::string mcp_name = name->valuestring;
++            bool hidden = false;
++            for (const char* prefix : kHiddenToolPrefixes) {
++                hidden = hidden || mcp_name.rfind(prefix, 0) == 0;
++            }
++            if (hidden) continue;
++            // Function names may only use [A-Za-z0-9_-]; MCP names have dots.
++            std::string function_name = mcp_name;
++            for (char& c : function_name) {
++                if (c == '.') c = '_';
++            }
++            tool_names_[function_name] = mcp_name;
++            cJSON* function = cJSON_CreateObject();
++            cJSON_AddStringToObject(function, "name", function_name.c_str());
++            cJSON* description = cJSON_GetObjectItem(tool, "description");
++            cJSON_AddStringToObject(function, "description",
++                                    cJSON_IsString(description) ? description->valuestring : "");
++            cJSON* schema = cJSON_GetObjectItem(tool, "inputSchema");
++            cJSON_AddItemToObject(function, "parameters",
++                                  schema ? cJSON_Duplicate(schema, true) : cJSON_CreateObject());
++            cJSON* entry = cJSON_CreateObject();
++            cJSON_AddStringToObject(entry, "type", "function");
++            cJSON_AddItemToObject(entry, "function", function);
++            cJSON_AddItemToArray(tools, entry);
++        }
++        cJSON* next = cJSON_GetObjectItem(result, "nextCursor");
++        if (cJSON_IsString(next)) cursor = next->valuestring;
++        cJSON_Delete(result);
++    } while (!cursor.empty());
++
++    // The sleep tool is ours, not the device's: it ends the session after the goodbye.
++    cJSON* sleep = cJSON_Parse(
++        "{\"type\":\"function\",\"function\":{\"name\":\"go_to_sleep\",\"description\":\"Go to sleep: "
++        "says your goodbye, closes your eyes and ends the conversation. Call it when the user says goodbye, "
++        "goodnight, or tells you to sleep or stop listening.\",\"parameters\":{\"type\":\"object\","
++        "\"properties\":{\"goodbye\":{\"type\":\"string\",\"description\":\"What you say before "
++        "falling asleep: a short, warm goodbye in your own voice, starting with one face emoji. It is spoken "
++        "aloud as is.\"}},\"required\":[\"goodbye\"]}}}");
++    cJSON_AddItemToArray(tools, sleep);
++    if (Board::GetInstance().GetCamera()) {
++        cJSON_AddItemToArray(tools, cJSON_Parse(
++            "{\"type\":\"function\",\"function\":{\"name\":\"take_photo\",\"description\":\"Take a photo "
++            "with your camera, which looks where your head points. Use it whenever the user asks what you can see "
++            "or wants you to look at something; move your head first if needed. The photo is then shown to you.\","
++            "\"parameters\":{\"type\":\"object\",\"properties\":{}}}}"));
++    }
++
++    char* printed = cJSON_PrintUnformatted(tools);
++    tools_json_ = printed ? printed : "[]";
++    cJSON_free(printed);
++    ESP_LOGI(TAG, "%d tools for the model", cJSON_GetArraySize(tools));
++    cJSON_Delete(tools);
++}
++
++std::string LocalAgentProtocol::CallTool(const std::string& name, const std::string& arguments) {
++    ESP_LOGI(TAG, "Tool %s %s", name.c_str(), arguments.c_str());
++    if (name == kSleepTool) {
++        sleep_pending_ = true;
++        sleep_goodbye_.clear();
++        if (cJSON* args = cJSON_Parse(arguments.c_str())) {
++            cJSON* goodbye = cJSON_GetObjectItem(args, "goodbye");
++            if (cJSON_IsString(goodbye)) sleep_goodbye_ = Trim(goodbye->valuestring);
++            cJSON_Delete(args);
++        }
++        return "Asleep.";
++    }
++    if (name == kPhotoTool) {
++        auto camera = Board::GetInstance().GetCamera();
++        std::string jpeg;
++        if (!camera || !camera->Capture() || !camera->GetJpeg(jpeg)) return "Error: the camera failed";
++        size_t len = 0;
++        mbedtls_base64_encode(nullptr, 0, &len, reinterpret_cast<const uint8_t*>(jpeg.data()), jpeg.size());
++        std::string b64(len, '\0');
++        mbedtls_base64_encode(reinterpret_cast<uint8_t*>(b64.data()), len, &len,
++                              reinterpret_cast<const uint8_t*>(jpeg.data()), jpeg.size());
++        b64.resize(len);
++        pending_photo_ = "data:image/jpeg;base64," + b64;
++        ESP_LOGI(TAG, "Photo: %u bytes JPEG", (unsigned)jpeg.size());
++        return "Photo taken. It is attached in the next message.";
++    }
++    auto it = tool_names_.find(name);
++    if (it == tool_names_.end()) return "Error: unknown tool " + name;
++    // Models sometimes send "" for no arguments; MCP wants an object.
++    cJSON* args = cJSON_Parse(arguments.c_str());
++    if (!cJSON_IsObject(args)) {
++        cJSON_Delete(args);
++        args = cJSON_CreateObject();
++    }
++    char* printed = cJSON_PrintUnformatted(args);
++    std::string params = "{\"name\":" + JsonEscape(it->second) + ",\"arguments\":" + (printed ? printed : "{}") + "}";
++    cJSON_free(printed);
++    cJSON_Delete(args);
++    // Head moves can take a few seconds before the tool replies.
++    std::string reply = McpRequest("tools/call", params, 15000);
++    return reply.empty() ? "Error: the tool did not answer" : reply;
++}
++
++std::string LocalAgentProtocol::Chat(const std::string& user_text) {
++    const int64_t now = esp_timer_get_time();
++    if (now - last_turn_us_ > kHistoryExpiryUs) history_.clear();
++    last_turn_us_ = now;
++    if (tools_json_.empty()) LoadTools();
++    // Old photos are sent only once: tens of KB each, on every request otherwise.
++    for (auto& m : history_) {
++        if (m.find("\"image_url\"") != std::string::npos) {
++            m = std::string("{\"role\":\"user\",\"content\":") + JsonEscape(kPhotoPlaceholder) + "}";
++        }
++    }
++
++    auto message_json = [](const char* role, const std::string& content) {
++        return std::string("{\"role\":\"") + role + "\",\"content\":" + JsonEscape(content) + "}";
++    };
++    const size_t turn_start = history_.size();
++    history_.push_back(message_json("user", user_text));
++    bool used_tools = false;
++
++    for (int round = 0; round < kMaxToolRounds && !aborted_; round++) {
++        cJSON* request = cJSON_CreateObject();
++        cJSON_AddStringToObject(request, "model", settings_.llm.model.c_str());
++        cJSON_AddNumberToObject(request, "max_tokens", 400);
++        cJSON* messages = cJSON_AddArrayToObject(request, "messages");
++        cJSON_AddItemToArray(messages, cJSON_Parse(message_json("system", settings_.prompt).c_str()));
++        for (const auto& m : history_) cJSON_AddItemToArray(messages, cJSON_Parse(m.c_str()));
++        cJSON_AddItemToObject(request, "tools", cJSON_Parse(tools_json_.c_str()));
++        char* printed = cJSON_PrintUnformatted(request);
++        std::string body = printed ? printed : "";
++        cJSON_free(printed);
++        cJSON_Delete(request);
++
++        cJSON* root = cJSON_Parse(PostJson(settings_.llm, "/chat/completions", std::move(body), 60000).c_str());
++        cJSON* choices = cJSON_GetObjectItem(root, "choices");
++        cJSON* message = cJSON_GetObjectItem(cJSON_GetArrayItem(choices, 0), "message");
++        if (!cJSON_IsObject(message)) {
++            cJSON_Delete(root);
++            break;
++        }
++        cJSON* content = cJSON_GetObjectItem(message, "content");
++        std::string reply = cJSON_IsString(content) ? Trim(content->valuestring) : "";
++        cJSON* tool_calls = cJSON_GetObjectItem(message, "tool_calls");
++
++        if (cJSON_GetArraySize(tool_calls) > 0) {
++            // Keep the model's tool request in the conversation, then the results.
++            cJSON* assistant = cJSON_CreateObject();
++            cJSON_AddStringToObject(assistant, "role", "assistant");
++            cJSON_AddStringToObject(assistant, "content", reply.c_str());
++            cJSON_AddItemToObject(assistant, "tool_calls", cJSON_Duplicate(tool_calls, true));
++            char* assistant_json = cJSON_PrintUnformatted(assistant);
++            history_.push_back(assistant_json ? assistant_json : "{}");
++            cJSON_free(assistant_json);
++            cJSON_Delete(assistant);
++
++            cJSON* call = nullptr;
++            cJSON_ArrayForEach(call, tool_calls) {
++                cJSON* id = cJSON_GetObjectItem(call, "id");
++                cJSON* function = cJSON_GetObjectItem(call, "function");
++                cJSON* name = cJSON_GetObjectItem(function, "name");
++                cJSON* arguments = cJSON_GetObjectItem(function, "arguments");
++                const std::string result =
++                    CallTool(cJSON_IsString(name) ? name->valuestring : "",
++                             cJSON_IsString(arguments) ? arguments->valuestring : "{}");
++                history_.push_back("{\"role\":\"tool\",\"tool_call_id\":" +
++                                   JsonEscape(cJSON_IsString(id) ? id->valuestring : "") +
++                                   ",\"content\":" + JsonEscape(result) + "}");
++            }
++            cJSON_Delete(root);
++            used_tools = true;
++            if (!pending_photo_.empty()) {
++                // Tool results are text-only in the OpenAI format; the image follows as a user message.
++                history_.push_back(
++                    "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"The photo you just took:\"},"
++                    "{\"type\":\"image_url\",\"image_url\":{\"url\":\"" + pending_photo_ + "\"}}]}");
++                pending_photo_.clear();
++            }
++            if (sleep_pending_) {
++                // No second model round for sleep: it only narrates the tool
++                // ("the conversation has ended..."). Say the goodbye and stop.
++                if (reply.empty()) reply = sleep_goodbye_;
++                if (reply.empty()) reply = Lines(danish_lines_).goodnight;
++                history_.push_back(message_json("assistant", reply));
++                return reply;
++            }
++            continue;
++        }
++        cJSON_Delete(root);
++
++        if (reply.empty() && used_tools) reply = Lines(danish_lines_).done;
++        if (reply.empty()) break;
++        history_.push_back(message_json("assistant", reply));
++        // Forget the oldest turns; history must start at a user message.
++        while (history_.size() > kMaxHistoryMessages ||
++               (!history_.empty() && history_.front().rfind("{\"role\":\"user\"", 0) != 0)) {
++            history_.erase(history_.begin());
++        }
++        return reply;
++    }
++    // Failed or aborted: drop the unfinished turn.
++    history_.resize(turn_start);
++    return "";
++}
++
++void LocalAgentProtocol::Speak(const std::string& text, const std::function<void()>& on_first_audio) {
++    if (text.empty() || !on_incoming_pcm_) return;
++    const int64_t t0 = esp_timer_get_time();
++
++    cJSON* request = cJSON_CreateObject();
++    cJSON_AddStringToObject(request, "model", settings_.tts.model.c_str());
++    cJSON_AddStringToObject(request, "voice", settings_.tts_voice.c_str());
++    cJSON_AddStringToObject(request, "input", text.c_str());
++    cJSON_AddStringToObject(request, "response_format", "pcm");
++    char* printed = cJSON_PrintUnformatted(request);
++    std::string body = printed ? printed : "";
++    cJSON_free(printed);
++    cJSON_Delete(request);
++
++    const std::string url = JoinUrl(settings_.tts.base_url, "/audio/speech");
++    auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
++    // esp-ml307 frees badly if the server hangs up first (its receive task
++    // calls back into the freed client), so keep the connection open and
++    // always close it from our side.
++    http->SetKeepAlive(true);
++    http->SetTimeout(120000);  // a local voice server may first have to load its model
++    http->SetHeader("Content-Type", "application/json");
++    if (!settings_.tts.key.empty()) http->SetHeader("Authorization", "Bearer " + settings_.tts.key);
++    http->SetContent(std::move(body));
++    if (!http->Open("POST", url)) {
++        ESP_LOGE(TAG, "TTS: cannot connect to %s", url.c_str());
++        return;
++    }
++    const int status = http->GetStatusCode();
++    if (status != 200) {
++        ESP_LOGE(TAG, "TTS HTTP %d: %.200s", status, http->ReadAll().c_str());
++        http->Close();
++        return;
++    }
++
++    // Chunks wait here until the pre-buffer is full (or the stream ends).
++    std::vector<std::vector<int16_t>> pending;
++    bool started = false;
++    bool playing = true;
++    auto flush = [&]() {
++        for (auto& chunk : pending) {
++            if (aborted_) {
++                playing = false;
++                break;
++            }
++            if (!started) {
++                on_first_audio();
++                // The app only takes audio once it has switched to speaking,
++                // which it does asynchronously after "tts start".
++                for (int i = 0; i < 100 && !started && !aborted_; i++) {
++                    std::vector<int16_t> copy = chunk;
++                    started = on_incoming_pcm_(std::move(copy), kTtsSampleRate);
++                    if (!started) vTaskDelay(pdMS_TO_TICKS(20));
++                }
++                if (!started) {
++                    playing = false;
++                    break;
++                }
++                ESP_LOGI(TAG, "TTS playing after %d ms", (int)((esp_timer_get_time() - t0) / 1000));
++            } else if (!on_incoming_pcm_(std::move(chunk), kTtsSampleRate)) {
++                playing = false;  // interrupted
++                break;
++            }
++        }
++        pending.clear();
++    };
++
++    std::vector<int16_t> chunk;
++    chunk.reserve(kTtsChunkSamples);
++    int odd_byte = -1;  // PCM can arrive split mid-sample
++    size_t total_bytes = 0;
++    char buffer[2048];
++    while (playing) {
++        const int n = http->Read(buffer, sizeof(buffer));
++        if (n <= 0) break;
++        total_bytes += n;
++        int i = 0;
++        if (odd_byte >= 0) {
++            chunk.push_back(static_cast<int16_t>(odd_byte | (static_cast<uint8_t>(buffer[0]) << 8)));
++            odd_byte = -1;
++            i = 1;
++        }
++        for (; i + 1 < n; i += 2) {
++            chunk.push_back(static_cast<int16_t>(static_cast<uint8_t>(buffer[i]) |
++                                                 (static_cast<uint8_t>(buffer[i + 1]) << 8)));
++            if (chunk.size() == kTtsChunkSamples) {
++                pending.push_back(std::move(chunk));
++                chunk = {};
++                chunk.reserve(kTtsChunkSamples);
++                if (started || pending.size() >= kTtsPrebufferChunks) flush();
++                if (!playing) break;
++            }
++        }
++        if (playing && i < n) odd_byte = static_cast<uint8_t>(buffer[i]);
++    }
++    if (playing && !chunk.empty()) pending.push_back(std::move(chunk));
++    if (playing) flush();
++    http->Close();
++    ESP_LOGI(TAG, "TTS %d ms, %.1f s of audio%s", (int)((esp_timer_get_time() - t0) / 1000),
++             total_bytes / 2.0f / kTtsSampleRate, playing ? "" : " (interrupted)");
++}
++
++void LocalAgentProtocol::ShowStatus(const char* status) {
++    Application::GetInstance().Schedule([status]() { Board::GetInstance().GetDisplay()->SetStatus(status); });
++}
++
++void LocalAgentProtocol::EmitJson(const std::string& json) {
++    last_incoming_time_ = std::chrono::steady_clock::now();
++    if (cJSON* root = cJSON_Parse(json.c_str())) {
++        if (on_incoming_json_) on_incoming_json_(root);
++        cJSON_Delete(root);
++    }
++}
++
++void LocalAgentProtocol::RunOnWorker(std::function<void()> job) {
++    auto* heap_job = new std::function<void()>(std::move(job));
++    if (xQueueSend(jobs_, &heap_job, 0) != pdTRUE) {
++        ESP_LOGW(TAG, "Worker busy, dropping job");
++        delete heap_job;
++    }
++}
++
++void LocalAgentProtocol::WorkerTask(void* arg) {
++    auto* self = static_cast<LocalAgentProtocol*>(arg);
++    while (true) {
++        std::function<void()>* job = nullptr;
++        if (xQueueReceive(self->jobs_, &job, portMAX_DELAY) == pdTRUE && job) {
++            (*job)();
++            delete job;
++        }
++    }
++}
++
++#endif  // CONFIG_KIT_LOCAL_AGENT
+diff --git a/main/protocols/local_agent_protocol.h b/main/protocols/local_agent_protocol.h
+new file mode 100644
+index 0000000..731cc8b
+--- /dev/null
++++ b/main/protocols/local_agent_protocol.h
+@@ -0,0 +1,113 @@
++#ifndef LOCAL_AGENT_PROTOCOL_H
++#define LOCAL_AGENT_PROTOCOL_H
++
++#include "protocol.h"
++
++#include <freertos/FreeRTOS.h>
++#include <freertos/queue.h>
++#include <freertos/task.h>
++
++#include <atomic>
++#include <condition_variable>
++#include <functional>
++#include <map>
++#include <mutex>
++#include <string>
++#include <vector>
++
++// Plays the voice server's role on the robot itself. Instead of streaming
++// audio to a server, it calls OpenAI-compatible HTTPS APIs directly:
++// speech-to-text, the LLM (with the robot's own MCP tools), then
++// text-to-speech. To the rest of the firmware it looks like any other
++// Protocol: it receives the "listen"/"abort"/"mcp" messages the app sends,
++// and emits the same "stt", "tts", "llm" and "mcp" messages a server would.
++class LocalAgentProtocol : public Protocol {
++public:
++    LocalAgentProtocol();
++    ~LocalAgentProtocol() override;
++
++    bool Start() override;
++    bool OpenAudioChannel() override;
++    void CloseAudioChannel(bool send_goodbye = true) override;
++    bool IsAudioChannelOpened() const override;
++    bool SendAudio(std::unique_ptr<AudioStreamPacket> packet) override;
++    void OnVoiceActivity(bool speaking) override;
++
++protected:
++    // All control messages from the app (listen, abort, mcp, ...) arrive here.
++    bool SendText(const std::string& text) override;
++
++private:
++    struct Endpoint {
++        std::string base_url;
++        std::string key;
++        std::string model;
++    };
++    struct Settings {
++        Endpoint llm;
++        Endpoint tts;
++        Endpoint stt;
++        std::string tts_voice;
++        std::string stt_language;
++        std::string reply_language;
++        std::string prompt;  // includes the reply-language line
++    };
++
++    void LoadSettings();
++    void HandleListen(const std::string& state);
++    void ResumeListening();
++    void FinishUtterance();
++    void ProcessUtterance(std::vector<std::vector<uint8_t>> packets);
++    std::string Transcribe(const std::string& ogg);
++    std::string Chat(const std::string& user_text);
++    std::string PostJson(const Endpoint& endpoint, const char* path, std::string body, int timeout_ms);
++    std::string CallTool(const std::string& name, const std::string& arguments);
++    // Streams the reply's speech; on_first_audio runs once, just before sound starts.
++    void Speak(const std::string& text, const std::function<void()>& on_first_audio);
++    void EmitJson(const std::string& json);
++    // Display status (status light) for states the app doesn't know about.
++    void ShowStatus(const char* status);
++    void RunOnWorker(std::function<void()> job);
++    static void WorkerTask(void* arg);
++
++    // The robot's own MCP server (head, LED, volume, ...), reached through the
++    // app as if we were a remote server. Returns the JSON-RPC "result" or
++    // "error" object, or "" on timeout.
++    std::string McpRequest(const std::string& method, const std::string& params_json, int timeout_ms = 5000);
++    void LoadTools();
++
++    Settings settings_;
++    bool danish_lines_ = false;  // the robot's own fallback lines in Danish
++    std::atomic<bool> channel_open_{false};
++    std::atomic<bool> aborted_{false};
++    std::atomic<bool> sleep_pending_{false};
++    std::string sleep_goodbye_;  // from the go_to_sleep call
++    std::string pending_photo_;  // data: URL from take_photo, sent with the next request
++
++    // Conversation so far as serialized chat messages; worker task only.
++    std::vector<std::string> history_;
++    int64_t last_turn_us_ = 0;
++    // OpenAI "tools" array (JSON) and the function name -> MCP tool name map.
++    std::string tools_json_;
++    std::map<std::string, std::string> tool_names_;
++
++    // Pending MCP requests, answered from SendText on the main task.
++    std::mutex mcp_mutex_;
++    std::condition_variable mcp_cv_;
++    std::map<int, std::string> mcp_replies_;
++    int next_mcp_id_ = 1;
++
++    // Utterance capture, guarded by mutex_.
++    std::mutex mutex_;
++    bool listening_ = false;
++    bool heard_voice_ = false;
++    bool voice_active_ = false;
++    int64_t listen_started_us_ = 0;
++    int64_t voice_ended_us_ = 0;
++    std::vector<std::vector<uint8_t>> packets_;
++
++    QueueHandle_t jobs_ = nullptr;
++    TaskHandle_t worker_ = nullptr;
++};
++
++#endif  // LOCAL_AGENT_PROTOCOL_H
+diff --git a/main/protocols/protocol.cc b/main/protocols/protocol.cc
+index 470cc91..5274d29 100644
+--- a/main/protocols/protocol.cc
++++ b/main/protocols/protocol.cc
+@@ -12,6 +12,10 @@ void Protocol::OnIncomingAudio(std::function<void(std::unique_ptr<AudioStreamPac
+     on_incoming_audio_ = callback;
+ }
+ 
++void Protocol::OnIncomingPcm(std::function<bool(std::vector<int16_t>&& pcm, int sample_rate)> callback) {
++    on_incoming_pcm_ = callback;
++}
++
+ void Protocol::OnAudioChannelOpened(std::function<void()> callback) {
+     on_audio_channel_opened_ = callback;
+ }
+diff --git a/main/protocols/protocol.h b/main/protocols/protocol.h
+index 28ef604..33a8898 100644
+--- a/main/protocols/protocol.h
++++ b/main/protocols/protocol.h
+@@ -62,6 +62,9 @@ public:
+     void OnNetworkError(std::function<void(const std::string& message)> callback);
+     void OnConnected(std::function<void()> callback);
+     void OnDisconnected(std::function<void()> callback);
++    // Kit: raw 16-bit mono PCM for playback (the on-device agent's TTS).
++    // The callback returns false when the device isn't speaking.
++    void OnIncomingPcm(std::function<bool(std::vector<int16_t>&& pcm, int sample_rate)> callback);
+ 
+     virtual bool Start() = 0;
+     virtual bool OpenAudioChannel() = 0;
+@@ -73,6 +76,8 @@ public:
+     virtual void SendStopListening();
+     virtual void SendAbortSpeaking(AbortReason reason);
+     virtual void SendMcpMessage(const std::string& message);
++    // Kit: voice activity from the device VAD; only the on-device agent uses it.
++    virtual void OnVoiceActivity(bool speaking) {}
+ 
+ protected:
+     std::function<void(const cJSON* root)> on_incoming_json_;
+@@ -82,6 +87,7 @@ protected:
+     std::function<void(const std::string& message)> on_network_error_;
+     std::function<void()> on_connected_;
+     std::function<void()> on_disconnected_;
++    std::function<bool(std::vector<int16_t>&& pcm, int sample_rate)> on_incoming_pcm_;
+ 
+     int server_sample_rate_ = 24000;
+     int server_frame_duration_ = 60;

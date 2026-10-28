@@ -1,0 +1,65 @@
+# Danish speech for the StackChan kit: hearing (Røst Whisper speech-to-text) and
+# voice (Røst Chatterbox text-to-speech), both from Denmark's CoRal project, both
+# running on your own machine. The robot's AI model can still be a cloud API.
+#
+# Needs: an NVIDIA GPU with about 8 GB of free memory, and the NVIDIA Container
+# Toolkit (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/).
+#
+#   docker compose up -d       first start: ~10 GB of downloads, then it converts
+#                              the speech-to-text model once (a few minutes)
+#
+# Then, in the web flasher: Speech = "My own Danish speech server", address =
+# this machine's LAN IP. Keep ports 8000/8881 on your LAN; there is no login.
+
+services:
+  # One-off: converts CoRal's official roest-v3 Whisper weights into the format
+  # speaches runs (faster-whisper / CTranslate2). Does nothing once it's done.
+  stt-model:
+    image: python:3.11-slim
+    volumes:
+      - ./data/stt:/hub
+      - ./stt-model/convert.sh:/convert.sh:ro
+    command: ["bash", "/convert.sh"]
+    restart: "no"
+
+  # Speech-to-text: OpenAI-compatible /v1/audio/transcriptions on port 8000.
+  stt:
+    image: ghcr.io/speaches-ai/speaches:latest-cuda
+    depends_on:
+      stt-model:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      WHISPER__COMPUTE_TYPE: float16
+      STT_MODEL_TTL: "-1"  # keep the model loaded: no slow first reply
+    volumes:
+      - ./data/stt:/home/ubuntu/.cache/huggingface/hub
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Text-to-speech: OpenAI-compatible /v1/audio/speech on port 8881 (plus /speak).
+  tts:
+    build: ./roest-tts
+    restart: unless-stopped
+    ports:
+      - "8881:8881"
+    environment:
+      ROEST_TTS_DEFAULT_VOICE: default  # the model's own speaker; or a file name from ./voices
+      ROEST_TTS_KEEPALIVE_MINS: "60"    # unloading frees GPU memory, but the next reply takes ~1 minute
+    volumes:
+      - ./data/tts:/root/.cache/huggingface
+      - ./voices:/voices:ro             # optional: ~10 s clean .wav clips; each becomes a voice
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

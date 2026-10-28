@@ -1,4 +1,4 @@
-# StackChan, without the cloud
+# StackChan, without the Chinese cloud
 
 A setup for the **M5Stack StackChan (K151)** desk robot that keeps it off the
 Chinese cloud services it ships with, and gives it a brain you choose (Claude,
@@ -7,24 +7,60 @@ OpenAI, or anything OpenAI-compatible).
 Out of the box, StackChan's AI agent streams your microphone to the xiaozhi
 cloud (`api.tenclass.net`) and talks to M5's StackChan server over plain HTTP
 (`47.113.125.164`). That cloud also controls the robot's firmware updates.
-This kit replaces both with a small server you run yourself, and adds a few
-things the stock firmware lacks.
+The kit replaces all of that, and adds things the stock firmware lacks.
 
-**What you get**
+**What you get, either way**
 
-- **Your voice stays at home.** Speech-to-text runs locally (Whisper).
-- **Pick the model** in one config block. The default is Claude Haiku via
-  Anthropic's API.
-- **A real body.** The model can move the head, change the LED, take and
-  describe photos, and go to sleep.
-- **A proper sleep mode.** "Go to sleep" gives closed eyes and a Zzz bubble,
-  and the head and motors stay still until you wake it.
+- **Pick the AI**: OpenAI, Claude, or anything OpenAI-compatible.
+- **A real body.** The model moves the head, sets the lights (colours and
+  effects like breathing or a rainbow), takes and looks at photos, and goes to
+  sleep.
+- **A proper sleep mode.** "Go to sleep" gives closed eyes, a Zzz bubble and
+  dark lights; head and motors stay still until you wake it.
 - **More faces:** surprised, thinking, loving (with a heart), embarrassed
   (blush), plus happy, sad, angry and doubtful. The model picks one per reply.
-- **Firmware updates only come from your own server.**
-- **Optional web search,** done by the server, never by the robot.
+- **No M5 or xiaozhi cloud**, and no firmware updates from anyone but you.
 
-## How it fits together
+## Two ways to run it
+
+| | **On-device** (recommended) | **With your own voice server** |
+|---|---|---|
+| What runs where | The robot calls the speech and AI services itself | A server on your network does speech and AI; the robot only talks to it |
+| You need | The robot, Wi-Fi, an API key, Chrome or Edge | Also an always-on machine with Docker |
+| Setup | Everything in a web page, over USB | Build and flash firmware, edit a config file |
+| Your voice goes to | The speech service you pick (or your own, see [Danish speech](speech-da/)) | Your server (local Whisper) |
+
+## On-device setup
+
+1. Plug the robot into your computer with a USB-C cable and open the
+   **[web flasher](https://magnuspihl.github.io/StackChan/)** in Chrome or Edge.
+2. **Connect**, then **Install firmware**. The first time, keep "save a backup"
+   ticked: that file is your way back to the factory firmware (the same page can
+   restore it).
+3. **Settings**: your Wi-Fi, the AI and speech providers and your API key(s),
+   the language it answers in, and optionally its personality. Save; the robot
+   restarts.
+4. Say **"Hi Stack-chan"** (or tap the screen) and talk.
+
+No StackChan World app needed: Wi-Fi is set from the page. You can come back
+any time to change settings; your keys never leave the USB cable.
+
+Things to know:
+
+- **Your API keys are stored on the robot, unencrypted.** Anyone holding it can
+  read them out. Use keys with a spending limit.
+- **What you say goes to the providers you pick**: your voice to speech-to-text,
+  the conversation and any photos you ask for to the AI, its replies to the
+  voice service.
+- The voice service must return raw 24 kHz audio (`response_format: "pcm"`),
+  as OpenAI does. For **Danish** with your own GPU, see [speech-da/](speech-da/).
+- To build the firmware yourself: `./firmware/build.sh` (Docker, ~10 minutes),
+  then flash with `./firmware/flash.sh` or point the web flasher at it
+  (`web/flasher/`, served from `localhost`).
+
+The rest of this README describes the server setup.
+
+## Server setup: how it fits together
 
 ```
  StackChan (robot)  ──Wi-Fi, LAN only──▶  your server (Docker)
@@ -36,7 +72,8 @@ things the stock firmware lacks.
 ```
 
 The robot only ever talks to your server. You can (and should) block it from
-the internet entirely on your router; it works fine that way.
+the internet entirely on your router; it works fine that way. Web search is
+optional, done by the server, never by the robot.
 
 ## What you need
 
@@ -53,8 +90,8 @@ the internet entirely on your router; it works fine that way.
 ### 1. Connect the robot to Wi-Fi (once, with the stock firmware)
 
 Set up Wi-Fi using M5's **StackChan World** app, the normal way. The kit
-firmware keeps the Wi-Fi settings already stored on the robot. (Wi-Fi setup
-without the app isn't implemented in the kit yet.)
+firmware keeps the Wi-Fi settings already stored on the robot. (The web
+flasher's Wi-Fi step only works with the on-device firmware.)
 
 ### 2. Start the server
 
@@ -136,10 +173,11 @@ Caveats:
   git-ignored.
 - The **StackChan World app's features** (remote avatar control, dances, video)
   don't work with this firmware: they need M5's cloud server.
-- The built-in **EzData** app on the robot still points at M5's cloud. Don't use
-  it; the router rule blocks it anyway.
+- The kit firmware removes the built-in **EzData** app, which talks to M5's cloud.
 
 ## Going back to the factory firmware
+
+With the [web flasher](https://magnuspihl.github.io/StackChan/): "Restore a backup", and pick the backup file. Or with esptool:
 
 ```sh
 esptool --chip esp32s3 --port /dev/ttyACM0 write-flash 0 firmware/out/factory-backup-<date>.bin
@@ -188,7 +226,7 @@ upstream changes, so nothing silently reverts.
 - If the server's IP changes, rebuild and reflash the firmware.
 - Each tool action (head, light, photo) takes a few seconds: speech-to-text,
   the model, then speech.
-- Wi-Fi setup still needs the official app once (step 1).
+- Server setup: Wi-Fi still needs the official app once (step 1).
 
 ## Credits
 

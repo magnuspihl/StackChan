@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StackChan kit: flasher and setup</title>
+<style>
+  :root { --fg: #1d2330; --muted: #5d6576; --line: #d9dde5; --accent: #2f6fde; --bad: #c62828; --ok: #2e7d32; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.5 system-ui, sans-serif; color: var(--fg); background: #f6f7f9; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; }
+  h2 { font-size: 1.15rem; margin: 0 0 8px; }
+  p { margin: 6px 0; }
+  .muted { color: var(--muted); }
+  section { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin: 16px 0; }
+  section.disabled { opacity: .5; pointer-events: none; }
+  button { font: inherit; padding: 8px 16px; border-radius: 8px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+  button.secondary { background: #fff; color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  label { display: block; margin: 10px 0 2px; font-weight: 600; font-size: .92rem; }
+  textarea { font: inherit; width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; }
+  input, select { font: inherit; width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; margin: 14px 0; padding: 4px 14px 12px; }
+  legend { font-weight: 700; padding: 0 6px; }
+  .row { display: flex; gap: 12px; } .row > div { flex: 1; }
+  .check { display: flex; gap: 8px; align-items: center; font-weight: 400; }
+  .check input { width: auto; }
+  progress { width: 100%; height: 14px; }
+  .warn { border-left: 4px solid #f0a020; background: #fff8e8; padding: 10px 12px; border-radius: 6px; margin: 10px 0; }
+  #log { background: #11151c; color: #c9d1d9; font: 12px/1.45 ui-monospace, monospace; padding: 10px; border-radius: 8px; height: 180px; overflow: auto; white-space: pre-wrap; }
+  .status { font-weight: 600; } .status.ok { color: var(--ok); } .status.bad { color: var(--bad); }
+  .buttons { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>StackChan kit</h1>
+  <p class="muted">Install the kit firmware on an M5Stack StackChan and set it up, from this page. Everything runs in your browser
+    and talks to the robot over the USB cable. Nothing you enter here is sent anywhere else.</p>
+
+  <div class="warn" id="no-serial" hidden><b>This browser can't talk to USB devices.</b> Use Chrome or Edge on a computer
+    (not a phone).</div>
+
+  <section>
+    <h2>Before you start</h2>
+    <p>With this firmware the robot calls the speech and AI services itself, over your Wi-Fi. There is no server to run.</p>
+    <div class="warn">
+      <p><b>Your API keys are stored on the robot, unencrypted.</b> Anyone who has the robot in their hands can read them
+        out. Treat it like a phone that is logged in; use keys with a spending limit.</p>
+      <p><b>What you say goes to the providers you pick:</b> your voice to the speech-to-text service, the conversation and
+        any photos you ask for to the AI model, its replies to the voice service. Nothing goes to M5Stack or China.</p>
+    </div>
+  </section>
+
+  <section id="step-connect">
+    <h2>1. Connect</h2>
+    <p>Plug the robot into this computer with a USB-C data cable, switch it on, then pick it in the list (it shows up as
+      "USB JTAG/serial debug unit" or similar).</p>
+    <div class="buttons"><button id="connect">Connect to the robot</button></div>
+    <p id="connect-status" class="status"></p>
+  </section>
+
+  <section id="step-flash" class="disabled">
+    <h2>2. Install the firmware</h2>
+    <p>Skip this if the kit firmware is already on the robot and you only want to change settings.</p>
+    <label class="check"><input type="checkbox" id="backup" checked> First save a full backup of what is on the robot now
+      (16 MB, a few minutes). Do this the first time: it is the only way back to the factory firmware.</label>
+    <div class="buttons"><button id="flash">Install firmware</button></div>
+    <p id="flash-status" class="status"></p>
+    <progress id="flash-progress" value="0" max="100" hidden></progress>
+  </section>
+
+  <section id="step-restore" class="disabled">
+    <h2>Restore a backup</h2>
+    <p>Puts a backup from step 2 back on the robot: the factory firmware if it was your first backup. This replaces
+      everything on the robot, kit firmware and settings included.</p>
+    <p class="muted">A backup also holds the robot's Wi-Fi password and any API keys that were on it when it was
+      made. Keep the file private.</p>
+    <label for="restore-file">Backup file (.bin, 16 MB)</label>
+    <input type="file" id="restore-file" accept=".bin,application/octet-stream">
+    <div class="buttons"><button id="restore" class="secondary">Restore this backup</button></div>
+    <p id="restore-status" class="status"></p>
+    <progress id="restore-progress" value="0" max="100" hidden></progress>
+  </section>
+
+  <section id="step-settings" class="disabled">
+    <h2>3. Settings</h2>
+    <p class="muted">Empty fields keep what the robot already has. You can come back and change settings any time; plug
+      the robot in and use only this step.</p>
+    <div class="buttons"><button class="secondary" id="read">Show current settings</button></div>
+    <p id="current" class="muted"></p>
+
+    <fieldset>
+      <legend>Wi-Fi</legend>
+      <div class="row">
+        <div><label for="ssid">Network name</label><input id="ssid" autocomplete="off"></div>
+        <div><label for="wifi-pass">Password</label><input id="wifi-pass" type="password" autocomplete="off"></div>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Services</legend>
+      <div class="row">
+        <div><label for="ai-preset">AI</label>
+          <select id="ai-preset">
+            <option value="openai">OpenAI</option>
+            <option value="anthropic">Claude (Anthropic)</option>
+            <option value="custom">Custom (any OpenAI-compatible service)</option>
+          </select></div>
+        <div><label for="speech-preset">Speech (hearing and voice)</label>
+          <select id="speech-preset">
+            <option value="openai">OpenAI</option>
+            <option value="danish">My own Danish speech server</option>
+            <option value="custom">Custom</option>
+          </select></div>
+      </div>
+      <div id="speech-server-row" hidden>
+        <label for="speech-server">Speech server address</label>
+        <input id="speech-server" placeholder="192.168.1.50">
+        <p class="muted">The computer running the Danish speech server (see <code>speech-da/</code> in the kit). Give it
+          a fixed IP address on your router.</p>
+      </div>
+      <label class="check"><input type="checkbox" id="same-key" checked> Use the same API key for all three</label>
+      <label for="reply_lang">The robot answers in</label><input id="reply_lang" placeholder="English">
+    </fieldset>
+
+    <fieldset>
+      <legend>AI model</legend>
+      <label for="llm_url">Base URL</label><input id="llm_url" placeholder="https://api.openai.com/v1">
+      <div class="row">
+        <div><label for="llm_key">API key</label><input id="llm_key" type="password" autocomplete="off"></div>
+        <div><label for="llm_model">Model</label><input id="llm_model"></div>
+      </div>
+      <p class="muted">Needs tool calling and image input (for the camera).</p>
+    </fieldset>
+
+    <fieldset>
+      <legend>Speech-to-text</legend>
+      <label for="stt_url">Base URL</label><input id="stt_url">
+      <div class="row">
+        <div><label for="stt_key">API key</label><input id="stt_key" type="password" autocomplete="off"></div>
+        <div><label for="stt_model">Model</label><input id="stt_model"></div>
+        <div><label for="stt_lang">Language</label><input id="stt_lang" placeholder="en"></div>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Voice (text-to-speech)</legend>
+      <label for="tts_url">Base URL</label><input id="tts_url">
+      <div class="row">
+        <div><label for="tts_key">API key</label><input id="tts_key" type="password" autocomplete="off"></div>
+        <div><label for="tts_model">Model</label><input id="tts_model"></div>
+        <div><label for="tts_voice">Voice</label><input id="tts_voice"></div>
+      </div>
+      <p class="muted">Must return raw 24 kHz audio for <code>response_format: "pcm"</code>, as OpenAI does.</p>
+    </fieldset>
+
+    <fieldset>
+      <legend>Personality and start-up</legend>
+      <label for="persona">Who the robot is (optional)</label>
+      <textarea id="persona" rows="4" placeholder="You are Stack-chan, a small desk robot with a round face, a camera, and a head that can pan and tilt. You are curious, a little cheeky, and genuinely helpful."></textarea>
+      <p class="muted">A few sentences in your own words. How it speaks, its face, head, lights and camera are handled
+        for you. Empty keeps what the robot has.
+        <a href="#" id="persona-default">Go back to the default personality</a></p>
+      <label class="check"><input type="checkbox" id="boot_ai" checked> Start in talk mode when switched on
+        (otherwise it starts at the app menu)</label>
+    </fieldset>
+
+    <div class="buttons"><button id="save">Save to the robot and restart it</button></div>
+    <p id="save-status" class="status"></p>
+  </section>
+
+  <section>
+    <h2>Log</h2>
+    <div id="log"></div>
+  </section>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>

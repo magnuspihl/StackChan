@@ -1,0 +1,63 @@
+# Builds the on-device firmware and publishes the web flasher (web/flasher)
+# together with it to GitHub Pages. Nothing secret is in the firmware: API keys
+# and Wi-Fi are entered in the flasher and go straight to the robot over USB.
+name: Flasher
+
+on:
+  push:
+    branches: [on-device]
+    paths: ["firmware/**", "web/flasher/**", ".github/workflows/flasher.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the on-device firmware
+        run: ./firmware/build.sh
+
+      - name: Assemble the site
+        run: |
+          mkdir -p _site/firmware
+          cp web/flasher/* _site/
+          cp firmware/out/bootloader.bin firmware/out/partition-table.bin firmware/out/ota_data_initial.bin \
+             firmware/out/stack-chan.bin firmware/out/generated_assets.bin _site/firmware/
+          # Addresses from the firmware's partition table (same as firmware/flash.sh).
+          cat > _site/firmware/manifest.json <<EOF
+          {
+            "version": "$(git describe --tags --always)",
+            "files": [
+              { "file": "bootloader.bin", "address": 0 },
+              { "file": "partition-table.bin", "address": 32768 },
+              { "file": "ota_data_initial.bin", "address": 53248 },
+              { "file": "stack-chan.bin", "address": 131072 },
+              { "file": "generated_assets.bin", "address": 10485760 }
+            ]
+          }
+          EOF
+          ( cd _site/firmware && sha256sum *.bin > SHA256SUMS )
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

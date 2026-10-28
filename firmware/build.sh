@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# Build the StackChan kit firmware for YOUR voice server.
+# Build the StackChan kit firmware.
 #
-#   ./firmware/build.sh <server-LAN-IP>
+#   ./firmware/build.sh                on-device: the robot calls the speech and
+#                                      LLM APIs itself; no server. Set it up with
+#                                      the web flasher (or flash.sh + flasher page).
+#   ./firmware/build.sh <server-ip>    server: the robot talks to your own voice
+#                                      server (see server/).
 #
-# Clones M5Stack's StackChan firmware at a pinned commit, applies the kit patch
-# (sleep mode, extra faces), points the robot at your server instead of the
-# xiaozhi / StackChan clouds, and builds it with Espressif's official Docker
-# image. Output lands in firmware/out/. Needs Docker; takes ~10 minutes the
-# first time.
+# Clones M5Stack's StackChan firmware at a pinned commit, applies the kit
+# patches, and builds it with Espressif's official Docker image. Output lands
+# in firmware/out/. Needs Docker; takes ~10 minutes the first time.
 set -euo pipefail
 
-SERVER_IP="${1:?usage: $0 <server LAN IP, e.g. 192.168.1.50>}"
+SERVER_IP="${1:-}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="$HERE/out"
 UPSTREAM_REPO="https://github.com/m5stack/StackChan.git"
@@ -18,7 +20,11 @@ UPSTREAM_COMMIT="eff0d6b5109663faec8f1d98848b4b0e5246bbfc"
 IDF_IMAGE="espressif/idf:v5.5.4"
 
 mkdir -p "$OUT"
-echo "Building firmware for server ${SERVER_IP} (StackChan ${UPSTREAM_COMMIT:0:7})"
+if [ -n "$SERVER_IP" ]; then
+  echo "Building firmware for server ${SERVER_IP} (StackChan ${UPSTREAM_COMMIT:0:7})"
+else
+  echo "Building on-device firmware (StackChan ${UPSTREAM_COMMIT:0:7})"
+fi
 
 docker run --rm \
   -v "$HERE:/kit" \
@@ -32,18 +38,25 @@ docker run --rm \
     git apply /kit/stackchan-kit.patch
     cd firmware
 
-    # The robot asks this URL for its voice-server address (instead of
-    # api.tenclass.net). The StackChan World cloud (47.113.125.164) is
-    # pointed at a dead local port: its app features are not used.
-    printf "CONFIG_OTA_URL=\"http://%s:8003/xiaozhi/ota/\"\nCONFIG_STACKCHAN_SERVER_URL=\"http://127.0.0.1:9\"\n" \
-      "$SERVER_IP" > sdkconfig.defaults.local
+    # The StackChan World cloud (47.113.125.164) is pointed at a dead local
+    # port either way: its app features are not used.
+    if [ -n "$SERVER_IP" ]; then
+      # The robot asks this URL for its voice-server address (instead of api.tenclass.net).
+      printf "CONFIG_OTA_URL=\"http://%s:8003/xiaozhi/ota/\"\nCONFIG_STACKCHAN_SERVER_URL=\"http://127.0.0.1:9\"\n" \
+        "$SERVER_IP" > sdkconfig.defaults.local
+    else
+      # No server: nothing to ask for updates either. API settings come from the flasher.
+      printf "CONFIG_OTA_URL=\"http://127.0.0.1:9/\"\nCONFIG_STACKCHAN_SERVER_URL=\"http://127.0.0.1:9\"\nCONFIG_KIT_LOCAL_AGENT=y\n" \
+        > sdkconfig.defaults.local
+    fi
 
     python3 fetch_repos.py
+    git -C xiaozhi-esp32 apply /kit/xiaozhi-kit.patch
     idf.py build
 
     cp build/bootloader/bootloader.bin build/partition_table/partition-table.bin \
        build/ota_data_initial.bin build/stack-chan.bin build/generated_assets.bin /kit/out/
-    echo "$SERVER_IP" > /kit/out/server-ip.txt
+    if [ -n "$SERVER_IP" ]; then echo "server $SERVER_IP"; else echo "on-device"; fi > /kit/out/mode.txt
     chown -R "$HOST_UID:$HOST_GID" /kit/out
   '
 
