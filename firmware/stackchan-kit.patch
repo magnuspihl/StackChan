@@ -137,7 +137,7 @@ index 1f80c1f..c28a71f 100644
      const uint8_t* GetFrameData()
      {
 diff --git a/firmware/main/hal/board/stackchan_display.cc b/firmware/main/hal/board/stackchan_display.cc
-index 7459888..253c169 100644
+index 7459888..0c099c8 100644
 --- a/firmware/main/hal/board/stackchan_display.cc
 +++ b/firmware/main/hal/board/stackchan_display.cc
 @@ -17,6 +17,10 @@
@@ -242,17 +242,20 @@ index 7459888..253c169 100644
  
          // Stop idle motion
          ESP_LOGW(TAG, "Stop idle motion");
-@@ -363,9 +411,6 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
+@@ -363,9 +411,9 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
          // Return to default pose
          auto& motion = GetStackChan().motion();
          motion.pitchServo().moveWithSpeed(0, 80);
 -
 -    } else if (strcmp(emotion, "doubtful") == 0) {
 -        avatar.setEmotion(Emotion::Doubt);
++        // Kit: then keep the motors still until woken (bumps and pets would
++        // otherwise re-engage them); the head-down move above still finishes.
++        motion::Servo::setMotionLocked(true);
      } else {
          ESP_LOGW(TAG, "Unknown emotion: %s, using NEUTRAL", emotion);
          avatar.setEmotion(Emotion::Neutral);
-@@ -410,6 +455,10 @@ void StackChanAvatarDisplay::ClearChatMessages()
+@@ -410,6 +458,10 @@ void StackChanAvatarDisplay::ClearChatMessages()
      DisplayLockGuard lock(this);
  
      stackchan.avatar().clearSpeech();
@@ -263,7 +266,7 @@ index 7459888..253c169 100644
  
      ESP_LOGI(TAG, "Chat messages cleared");
  }
-@@ -503,8 +552,7 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
+@@ -503,8 +555,7 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
              speaking_modifier_id_ = -1;
          }
  
@@ -273,7 +276,7 @@ index 7459888..253c169 100644
  
      } else if (strcmp(status, Lang::Strings::STANDBY) == 0) {
          _is_xiaozhi_ready = true;
-@@ -518,21 +566,26 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
+@@ -518,21 +569,26 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
  
          is_idle = true;
  
@@ -305,7 +308,7 @@ index 7459888..253c169 100644
          // Start idle motion
          ESP_LOGW(TAG, "Start idle motion");
          if (idle_motion_modifier_id_ < 0) {
-@@ -562,9 +615,86 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
+@@ -562,9 +618,87 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
          _is_xiaozhi_idle = false;
      }
  
@@ -319,6 +322,7 @@ index 7459888..253c169 100644
 +    // session, so listening alone must not wake it.
 +    if (is_sleeping_ && strcmp(status, Lang::Strings::CONNECTING) == 0) {
 +        is_sleeping_ = false;
++        motion::Servo::setMotionLocked(false);
          avatar.setSpeech("");
 +        avatar.setEmotion(Emotion::Neutral);
 +    }
@@ -1269,3 +1273,52 @@ index 0000000..ed78a14
 +};
 +
 +}  // namespace stackchan
+diff --git a/firmware/main/stackchan/motion/servo.cpp b/firmware/main/stackchan/motion/servo.cpp
+index cfbefe0..5dcfb0a 100644
+--- a/firmware/main/stackchan/motion/servo.cpp
++++ b/firmware/main/stackchan/motion/servo.cpp
+@@ -107,6 +107,9 @@ void Servo::apply_default_spring_options()
+ 
+ void Servo::update_angle_anim_target(int angle)
+ {
++    if (_motion_locked) {
++        return;  // Kit: asleep
++    }
+     angle = uitk::clamp(angle, _angle_limit.x, _angle_limit.y);
+ 
+     if (_auto_angle_sync_enabled) {
+diff --git a/firmware/main/stackchan/motion/servo.h b/firmware/main/stackchan/motion/servo.h
+index f621c64..f000669 100644
+--- a/firmware/main/stackchan/motion/servo.h
++++ b/firmware/main/stackchan/motion/servo.h
+@@ -63,6 +63,20 @@ public:
+     {
+     }
+ 
++    /**
++     * @brief Kit: while locked, every servo ignores new targets (a move already
++     * under way finishes), so torque is released and the motors stay quiet.
++     * Used while StackChan sleeps: bump/pet reactions still show on the face.
++     */
++    static void setMotionLocked(bool locked)
++    {
++        _motion_locked = locked;
++    }
++    static bool isMotionLocked()
++    {
++        return _motion_locked;
++    }
++
+     /**
+      * @brief Get servo current angle
+      *
+@@ -179,6 +193,9 @@ protected:
+     void update_angle_anim_target(int angle);
+     void stop_motion_at_angle(int angle);
+     uitk::SpringOptions_t map_speed_to_spring_options(int speed);
++
++private:
++    static inline bool _motion_locked = false;  // Kit
+ };
+ 
+ }  // namespace stackchan::motion

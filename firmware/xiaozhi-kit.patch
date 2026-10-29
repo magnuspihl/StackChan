@@ -1,5 +1,5 @@
 diff --git a/main/application.cc b/main/application.cc
-index e67514b..b1ecc44 100644
+index e67514b..ad33ac1 100644
 --- a/main/application.cc
 +++ b/main/application.cc
 @@ -10,6 +10,7 @@
@@ -56,13 +56,14 @@ index e67514b..b1ecc44 100644
  
      protocol_->OnConnected([this]() {
          DismissAlert();
-@@ -505,6 +520,13 @@ void Application::InitializeProtocol() {
+@@ -505,6 +520,14 @@ void Application::InitializeProtocol() {
              audio_service_.PushPacketToDecodeQueue(std::move(packet));
          }
      });
 +
 +    protocol_->OnIncomingPcm([this](std::vector<int16_t>&& pcm, int sample_rate) {
-+        if (GetDeviceState() != kDeviceStateSpeaking) {
++        // Not before the speaking state is fully set up: entering it clears the playback queue.
++        if (GetDeviceState() != kDeviceStateSpeaking || !pcm_ready_) {
 +            return false;
 +        }
 +        return audio_service_.PushPcmToPlaybackQueue(std::move(pcm), sample_rate);
@@ -70,6 +71,42 @@ index e67514b..b1ecc44 100644
      
      protocol_->OnAudioChannelOpened([this, codec, &board]() {
          board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+@@ -840,6 +863,7 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
+ void Application::HandleStateChangedEvent() {
+     DeviceState new_state = state_machine_.GetState();
+     clock_ticks_ = 0;
++    pcm_ready_ = false;  // Kit: set again once speaking is set up
+ 
+     auto& board = Board::GetInstance();
+     auto display = board.GetDisplay();
+@@ -900,6 +924,7 @@ void Application::HandleStateChangedEvent() {
+                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+             }
+             audio_service_.ResetDecoder();
++            pcm_ready_ = true;  // Kit: the queue is clear, PCM may come now
+             break;
+         case kDeviceStateWifiConfiguring:
+             audio_service_.EnableVoiceProcessing(false);
+diff --git a/main/application.h b/main/application.h
+index 1418901..589fdbf 100644
+--- a/main/application.h
++++ b/main/application.h
+@@ -1,6 +1,7 @@
+ #ifndef _APPLICATION_H_
+ #define _APPLICATION_H_
+ 
++#include <atomic>
+ #include <freertos/FreeRTOS.h>
+ #include <freertos/event_groups.h>
+ #include <freertos/task.h>
+@@ -138,6 +139,7 @@ private:
+ 
+     bool has_server_time_ = false;
+     bool aborted_ = false;
++    std::atomic<bool> pcm_ready_{false};  // Kit: speaking state set up, PCM playback may start
+     bool assets_version_checked_ = false;
+     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
+     int clock_ticks_ = 0;
 diff --git a/main/audio/audio_service.cc b/main/audio/audio_service.cc
 index 350ac58..002dfe5 100644
 --- a/main/audio/audio_service.cc
@@ -154,10 +191,10 @@ index 9e73014..03e8573 100644
  class Theme {
 diff --git a/main/protocols/local_agent_protocol.cc b/main/protocols/local_agent_protocol.cc
 new file mode 100644
-index 0000000..1634ee6
+index 0000000..86b0f38
 --- /dev/null
 +++ b/main/protocols/local_agent_protocol.cc
-@@ -0,0 +1,965 @@
+@@ -0,0 +1,974 @@
 +#include "local_agent_protocol.h"
 +
 +#include <sdkconfig.h>
@@ -1028,6 +1065,7 @@ index 0000000..1634ee6
 +    std::vector<std::vector<int16_t>> pending;
 +    bool started = false;
 +    bool playing = true;
++    int64_t play_start_us = 0;
 +    auto flush = [&]() {
 +        for (auto& chunk : pending) {
 +            if (aborted_) {
@@ -1048,6 +1086,7 @@ index 0000000..1634ee6
 +                    break;
 +                }
 +                ESP_LOGI(TAG, "TTS playing after %d ms", (int)((esp_timer_get_time() - t0) / 1000));
++                play_start_us = esp_timer_get_time();
 +            } else if (!on_incoming_pcm_(std::move(chunk), kTtsSampleRate)) {
 +                playing = false;  // interrupted
 +                break;
@@ -1087,6 +1126,13 @@ index 0000000..1634ee6
 +    if (playing && !chunk.empty()) pending.push_back(std::move(chunk));
 +    if (playing) flush();
 +    http->Close();
++    // The queue may still hold up to 2 s, and the app reconfigures the audio
++    // hardware for listening as soon as the queue is empty, cutting the last
++    // piece short. So end the speaking state only once it has really played.
++    if (playing && play_start_us) {
++        const int64_t end_us = play_start_us + static_cast<int64_t>(total_bytes / 2) * 1000000 / kTtsSampleRate + 150000;
++        while (!aborted_ && esp_timer_get_time() < end_us) vTaskDelay(pdMS_TO_TICKS(20));
++    }
 +    ESP_LOGI(TAG, "TTS %d ms, %.1f s of audio%s", (int)((esp_timer_get_time() - t0) / 1000),
 +             total_bytes / 2.0f / kTtsSampleRate, playing ? "" : " (interrupted)");
 +}
