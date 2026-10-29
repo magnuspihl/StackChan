@@ -24,7 +24,8 @@ const SPEECH_PRESETS = {
   }),
   custom: null,
 };
-const PLAIN_KEYS = ["llm_url", "llm_model", "stt_url", "stt_model", "stt_lang", "tts_url", "tts_model", "tts_voice", "reply_lang"];
+const PLAIN_KEYS = ["llm_url", "llm_model", "stt_url", "stt_model", "stt_lang", "tts_url", "tts_model", "tts_voice", "reply_lang",
+  "sleep_min"];
 const SECRET_KEYS = ["llm_key", "stt_key", "tts_key"];
 
 const $ = (id) => document.getElementById(id);

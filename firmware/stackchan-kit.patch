@@ -137,20 +137,32 @@ index 1f80c1f..c28a71f 100644
      const uint8_t* GetFrameData()
      {
 diff --git a/firmware/main/hal/board/stackchan_display.cc b/firmware/main/hal/board/stackchan_display.cc
-index 7459888..186172c 100644
+index 7459888..253c169 100644
 --- a/firmware/main/hal/board/stackchan_display.cc
 +++ b/firmware/main/hal/board/stackchan_display.cc
-@@ -18,6 +18,9 @@
+@@ -17,6 +17,10 @@
+ #include <stackchan/stackchan.h>
  #include <assets/lang_config.h>
  #include <hal/hal.h>
- 
++#include <application.h>
++
 +// Kit patch: ASCII so it renders in any font (the original used U+2026).
 +static constexpr const char* kSleepSpeech = "Zzz...";
-+
+ 
  using namespace stackchan;
  using namespace stackchan::avatar;
+@@ -202,6 +206,10 @@ StackChanAvatarDisplay::~StackChanAvatarDisplay()
+         esp_timer_stop(preview_timer_);
+         esp_timer_delete(preview_timer_);
+     }
++    if (sleep_timer_ != nullptr) {
++        esp_timer_stop(sleep_timer_);
++        esp_timer_delete(sleep_timer_);
++    }
  
-@@ -326,30 +329,70 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
+     if (preview_image_ != nullptr) {
+         lv_obj_del(preview_image_);
+@@ -326,30 +334,70 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
          return;
      }
  
@@ -230,7 +242,7 @@ index 7459888..186172c 100644
  
          // Stop idle motion
          ESP_LOGW(TAG, "Stop idle motion");
-@@ -363,9 +406,6 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
+@@ -363,9 +411,6 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
          // Return to default pose
          auto& motion = GetStackChan().motion();
          motion.pitchServo().moveWithSpeed(0, 80);
@@ -240,7 +252,7 @@ index 7459888..186172c 100644
      } else {
          ESP_LOGW(TAG, "Unknown emotion: %s, using NEUTRAL", emotion);
          avatar.setEmotion(Emotion::Neutral);
-@@ -410,6 +450,10 @@ void StackChanAvatarDisplay::ClearChatMessages()
+@@ -410,6 +455,10 @@ void StackChanAvatarDisplay::ClearChatMessages()
      DisplayLockGuard lock(this);
  
      stackchan.avatar().clearSpeech();
@@ -251,7 +263,7 @@ index 7459888..186172c 100644
  
      ESP_LOGI(TAG, "Chat messages cleared");
  }
-@@ -503,8 +547,7 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
+@@ -503,8 +552,7 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
              speaking_modifier_id_ = -1;
          }
  
@@ -261,7 +273,7 @@ index 7459888..186172c 100644
  
      } else if (strcmp(status, Lang::Strings::STANDBY) == 0) {
          _is_xiaozhi_ready = true;
-@@ -518,21 +561,26 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
+@@ -518,21 +566,26 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
  
          is_idle = true;
  
@@ -293,12 +305,15 @@ index 7459888..186172c 100644
          // Start idle motion
          ESP_LOGW(TAG, "Start idle motion");
          if (idle_motion_modifier_id_ < 0) {
-@@ -562,9 +610,51 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
+@@ -562,9 +615,86 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
          _is_xiaozhi_idle = false;
      }
  
 -    // Clear sleep state
 -    if (is_sleeping_) {
++    // Kit: count down to sleep while waiting for the wake word.
++    ArmSleepTimer(is_idle && !is_sleeping_);
++
 +    // Kit patch: only a NEW session (connecting, after a wake word or tap) wakes
 +    // StackChan. The goodbye ends speaking -> listening -> idle inside the old
 +    // session, so listening alone must not wake it.
@@ -344,20 +359,55 @@ index 7459888..186172c 100644
 +            lv_obj_set_style_opa(static_cast<lv_obj_t*>(obj), static_cast<lv_opa_t>(v), 0);
 +        });
 +        lv_anim_start(&a);
++    }
++}
++
++void StackChanAvatarDisplay::ArmSleepTimer(bool arm)
++{
++    if (sleep_timer_ == nullptr) {
++        esp_timer_create_args_t args = {};
++        args.callback                = [](void* arg) {
++            auto* self = static_cast<StackChanAvatarDisplay*>(arg);
++            // Same as "go to sleep", on the main task; only if still waiting and awake.
++            Application::GetInstance().Schedule([self]() {
++                if (_is_xiaozhi_idle && !self->is_sleeping_) {
++                    ESP_LOGI(TAG, "No conversation for a while: going to sleep");
++                    self->SetEmotion("sleepy");
++                }
++            });
++        };
++        args.arg  = this;
++        args.name = "kit_sleep";
++        if (esp_timer_create(&args, &sleep_timer_) != ESP_OK) {
++            sleep_timer_ = nullptr;
++            return;
++        }
++    }
++    esp_timer_stop(sleep_timer_);
++    if (!arm) {
++        return;
++    }
++    Settings settings("kit", false);
++    const int minutes = atoi(settings.GetString("sleep_min", "10").c_str());
++    if (minutes > 0) {
++        esp_timer_start_once(sleep_timer_, static_cast<uint64_t>(minutes) * 60 * 1000 * 1000);
      }
  }
  
 diff --git a/firmware/main/hal/board/stackchan_display.h b/firmware/main/hal/board/stackchan_display.h
-index f16f1f3..10fd330 100644
+index f16f1f3..2f95a15 100644
 --- a/firmware/main/hal/board/stackchan_display.h
 +++ b/firmware/main/hal/board/stackchan_display.h
-@@ -19,6 +19,10 @@ private:
+@@ -19,6 +19,13 @@ private:
      int idle_expression_modifier_id_    = -1;
      int blink_modifier_id_              = -1;
      bool is_sleeping_                   = false;
 +    // Kit: status dot in the top right corner (green = live mic, breathing blue =
 +    // thinking, blue = speaking). The LEDs are left to the model.
 +    lv_obj_t* status_dot_ = nullptr;
++    // Kit: fall asleep after a quiet spell (NVS kit/sleep_min, default 10 min, 0 = never).
++    esp_timer_handle_t sleep_timer_ = nullptr;
++    void ArmSleepTimer(bool arm);
 +    void SetStatusDot(bool visible, uint32_t color = 0, bool breathe = false);
      uint8_t idle_motion_level_          = 2;
  
@@ -568,7 +618,7 @@ index 0d73851..192f411 100644
                         "Create a reminder. Duration is in seconds. Message is what to say when time is up. Set repeat "
 diff --git a/firmware/main/hal/kit_serial_config.cpp b/firmware/main/hal/kit_serial_config.cpp
 new file mode 100644
-index 0000000..8b0990f
+index 0000000..8f85df7
 --- /dev/null
 +++ b/firmware/main/hal/kit_serial_config.cpp
 @@ -0,0 +1,248 @@
@@ -620,7 +670,7 @@ index 0000000..8b0990f
 +    {"llm_url", false},   {"llm_key", true},    {"llm_model", false}, {"tts_url", false},
 +    {"tts_key", true},    {"tts_model", false}, {"tts_voice", false}, {"stt_url", false},
 +    {"stt_key", true},    {"stt_model", false}, {"stt_lang", false},  {"reply_lang", false},
-+    {"persona", false},   {"prompt", false},
++    {"persona", false},   {"prompt", false},    {"sleep_min", false},
 +};
 +
 +const KitKey* FindKey(const char* name)

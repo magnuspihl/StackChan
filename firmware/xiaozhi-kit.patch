@@ -154,10 +154,10 @@ index 9e73014..03e8573 100644
  class Theme {
 diff --git a/main/protocols/local_agent_protocol.cc b/main/protocols/local_agent_protocol.cc
 new file mode 100644
-index 0000000..7174168
+index 0000000..1634ee6
 --- /dev/null
 +++ b/main/protocols/local_agent_protocol.cc
-@@ -0,0 +1,923 @@
+@@ -0,0 +1,965 @@
 +#include "local_agent_protocol.h"
 +
 +#include <sdkconfig.h>
@@ -187,7 +187,9 @@ index 0000000..7174168
 +// Silence after speech that ends an utterance, and safety limits.
 +constexpr int64_t kEndOfSpeechSilenceUs = 900 * 1000;
 +constexpr int64_t kMaxUtteranceUs = 20 * 1000 * 1000;
-+// Nobody spoke for this long: end the session, back to wake-word standby.
++// No real exchange (a usable transcript or a reply) for this long: end the
++// session, back to wake-word standby. Noise that only produces empty or phantom
++// transcripts doesn't count, or a noisy room would keep the session open forever.
 +constexpr int64_t kSessionIdleUs = 30 * 1000 * 1000;
 +// Utterances shorter than this are noise; Whisper turns them into "You".
 +constexpr size_t kMinUtterancePackets = 10;
@@ -247,12 +249,54 @@ index 0000000..7174168
 +    "goodbye or tells you to sleep, call go_to_sleep with your goodbye.";
 +
 +// What Whisper hears in near-silence or noise. Never a real request.
-+constexpr const char* kPhantomTranscripts[] = {
-+    "you", "thanks for watching", "thank you for watching",
-+    "tak fordi du så med", "tak for at se med", "tak fordi i så med",
++// Whisper's hallucinations on silence, noise or the robot's own voice: it
++// learned them from video subtitles. Nobody says these to a desk robot.
++constexpr const char* kPhantomExact[] = {"you", "thank you", "bye"};
++constexpr const char* kPhantomPhrases[] = {
++    "thanks for watching", "thank you for watching", "subtitles by", "please subscribe",
++    "tak fordi du så med", "tak for at se med", "tak fordi i så med", "undertekster", "tekstning af",
 +};
-+// ...and subtitle credits it learned from video, in any length.
-+constexpr const char* kPhantomPrefixes[] = {"subtitles by", "undertekster", "tekstning af"};
++
++// The same word or short phrase several times in a row ("bye bye bye bye") is
++// how Whisper loops when it hears nothing.
++bool HasRunawayRepeat(const std::vector<std::string>& words) {
++    for (size_t n = 1; n <= 3; n++) {
++        int run = 1;
++        for (size_t i = n; i + n <= words.size(); i += n) {
++            bool same = true;
++            for (size_t k = 0; k < n; k++) same = same && words[i + k] == words[i - n + k];
++            run = same ? run + 1 : 1;
++            if (run >= 4) return true;
++        }
++    }
++    return false;
++}
++
++bool IsPhantom(const std::string& text) {
++    std::string lower;  // letters, digits and spaces only (UTF-8 kept)
++    for (char c : text) {
++        const unsigned char u = static_cast<unsigned char>(c);
++        if (u >= 0x80 || isalnum(u)) {
++            lower += static_cast<char>(tolower(u));
++        } else if (!lower.empty() && lower.back() != ' ') {
++            lower += ' ';
++        }
++    }
++    while (!lower.empty() && lower.back() == ' ') lower.pop_back();
++    for (const char* p : kPhantomExact) {
++        if (lower == p) return true;
++    }
++    for (const char* p : kPhantomPhrases) {
++        if (lower.find(p) != std::string::npos) return true;
++    }
++    std::vector<std::string> words;
++    for (size_t i = 0, j; i < lower.size(); i = j + 1) {
++        j = lower.find(' ', i);
++        if (j == std::string::npos) j = lower.size();
++        words.push_back(lower.substr(i, j - i));
++    }
++    return HasRunawayRepeat(words);
++}
 +
 +// The few lines the robot says itself, in the reply language when it knows it.
 +struct FixedLines {
@@ -446,6 +490,7 @@ index 0000000..7174168
 +    server_sample_rate_ = kTtsSampleRate;
 +    server_frame_duration_ = 60;
 +    last_incoming_time_ = std::chrono::steady_clock::now();
++    last_activity_us_ = esp_timer_get_time();
 +    channel_open_ = true;
 +    if (on_audio_channel_opened_) on_audio_channel_opened_();
 +    return true;
@@ -548,7 +593,7 @@ index 0000000..7174168
 +        if (!heard_voice_) {
 +            // Before anyone speaks, keep only a short pre-roll.
 +            if (packets_.size() > kPrerollPackets) packets_.erase(packets_.begin());
-+            if (now - listen_started_us_ > kSessionIdleUs) {
++            if (now - last_activity_us_ > kSessionIdleUs) {
 +                listening_ = false;
 +                close = true;
 +            }
@@ -560,7 +605,7 @@ index 0000000..7174168
 +    }
 +    if (finish) FinishUtterance();
 +    if (close) {
-+        ESP_LOGI(TAG, "No speech for %d s, ending the session", (int)(kSessionIdleUs / 1000000));
++        ESP_LOGI(TAG, "No conversation for %d s, ending the session", (int)(kSessionIdleUs / 1000000));
 +        RunOnWorker([this]() { CloseAudioChannel(); });
 +    }
 +    return true;
@@ -589,19 +634,15 @@ index 0000000..7174168
 +    int64_t t0 = esp_timer_get_time();
 +    std::string text = Transcribe(BuildOggOpus(packets));
 +    ESP_LOGI(TAG, "STT %d ms: \"%s\"", (int)((esp_timer_get_time() - t0) / 1000), text.c_str());
-+    std::string lower;
-+    for (char c : text) {
-+        if (c != '.' && c != ',' && c != '!') lower += static_cast<char>(tolower(static_cast<unsigned char>(c)));
-+    }
-+    bool phantom = false;
-+    for (const char* p : kPhantomTranscripts) phantom = phantom || lower == p;
-+    for (const char* p : kPhantomPrefixes) phantom = phantom || lower.rfind(p, 0) == 0;
++    const bool phantom = !text.empty() && IsPhantom(text);
++    if (phantom) ESP_LOGI(TAG, "Ignoring a Whisper phantom");
 +    if (text.empty() || phantom || aborted_) {
 +        if (!aborted_) ShowStatus(Lang::Strings::LISTENING);  // nothing to answer: the mic is live again
 +        ResumeListening();
 +        return;
 +    }
 +    EmitJson("{\"type\":\"stt\",\"text\":" + JsonEscape(text) + "}");
++    last_activity_us_ = esp_timer_get_time();
 +    // Show that it heard and is working on it; the LLM can take a while.
 +    EmitJson("{\"type\":\"llm\",\"emotion\":\"thinking\"}");
 +
@@ -635,6 +676,7 @@ index 0000000..7174168
 +        EmitJson("{\"type\":\"tts\",\"state\":\"sentence_start\",\"text\":" + JsonEscape(spoken) + "}");
 +    };
 +    Speak(spoken, announce);
++    last_activity_us_ = esp_timer_get_time();
 +    announce();  // no audio came: still show the reply
 +    // The app goes back to listening (and sends "listen start") once playback drains.
 +    EmitJson("{\"type\":\"tts\",\"state\":\"stop\"}");
@@ -1083,10 +1125,10 @@ index 0000000..7174168
 +#endif  // CONFIG_KIT_LOCAL_AGENT
 diff --git a/main/protocols/local_agent_protocol.h b/main/protocols/local_agent_protocol.h
 new file mode 100644
-index 0000000..731cc8b
+index 0000000..77cfd63
 --- /dev/null
 +++ b/main/protocols/local_agent_protocol.h
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,114 @@
 +#ifndef LOCAL_AGENT_PROTOCOL_H
 +#define LOCAL_AGENT_PROTOCOL_H
 +
@@ -1170,6 +1212,7 @@ index 0000000..731cc8b
 +    std::atomic<bool> channel_open_{false};
 +    std::atomic<bool> aborted_{false};
 +    std::atomic<bool> sleep_pending_{false};
++    std::atomic<int64_t> last_activity_us_{0};  // last usable transcript or reply
 +    std::string sleep_goodbye_;  // from the go_to_sleep call
 +    std::string pending_photo_;  // data: URL from take_photo, sent with the next request
 +
