@@ -5,7 +5,7 @@ name: Flasher
 
 on:
   push:
-    branches: [on-device]
+    branches: [main]
     paths: ["firmware/**", "web/flasher/**", ".github/workflows/flasher.yml"]
   workflow_dispatch:
 
