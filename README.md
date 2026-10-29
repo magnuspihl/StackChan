@@ -28,7 +28,7 @@ The kit replaces all of that, and adds things the stock firmware lacks.
 | What runs where | The robot calls the speech and AI services itself | A server on your network does speech and AI; the robot only talks to it |
 | You need | The robot, Wi-Fi, an API key, Chrome or Edge | Also an always-on machine with Docker |
 | Setup | Everything in a web page, over USB | Build and flash firmware, edit a config file |
-| Your voice goes to | The speech service you pick (or your own, see [Danish speech](speech-da/)) | Your server (local Whisper) |
+| Your voice goes to | The speech service you pick (or your own, see [speech/](speech/)) | Your server (local Whisper) |
 
 ## On-device setup
 
@@ -53,7 +53,7 @@ Things to know:
   the conversation and any photos you ask for to the AI, its replies to the
   voice service.
 - The voice service must return raw 24 kHz audio (`response_format: "pcm"`),
-  as OpenAI does. For **Danish** with your own GPU, see [speech-da/](speech-da/).
+  as OpenAI does. To keep speech on your own machine (Danish or English, NVIDIA GPU), see [speech/](speech/).
 - To build the firmware yourself: `./firmware/build.sh` (Docker, ~10 minutes),
   then flash with `./firmware/flash.sh` or point the web flasher at it
   (`web/flasher/`, served from `localhost`).

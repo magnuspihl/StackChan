@@ -17,10 +17,16 @@ const SPEECH_PRESETS = {
     stt_url: "https://api.openai.com/v1", stt_model: "gpt-4o-mini-transcribe", stt_lang: "en",
     tts_url: "https://api.openai.com/v1", tts_model: "gpt-4o-mini-tts", tts_voice: "coral", reply_lang: "English",
   }),
-  // speech-da/docker-compose.yml: speaches with roest-v3 Whisper on :8000, roest-tts on :8881.
+  // speech/docker-compose.yml: speaches on :8000 (both languages' hearing, the English voice),
+  // roest-tts (the Danish voice) on :8881.
   danish: (server) => ({
     stt_url: `http://${server}:8000/v1`, stt_model: "local/roest-v3-whisper-1.5b-ct2", stt_lang: "da",
     tts_url: `http://${server}:8881/v1`, tts_model: "roest", tts_voice: "default", reply_lang: "Danish",
+  }),
+  english: (server) => ({
+    stt_url: `http://${server}:8000/v1`, stt_model: "Systran/faster-distil-whisper-large-v3", stt_lang: "en",
+    tts_url: `http://${server}:8000/v1`, tts_model: "speaches-ai/Kokoro-82M-v1.0-ONNX", tts_voice: "af_heart",
+    reply_lang: "English",
   }),
   custom: null,
 };
@@ -295,14 +301,14 @@ function applyAiPreset() {
 
 function applySpeechPreset() {
   const speech = $("speech-preset").value;
-  $("speech-server-row").hidden = speech !== "danish";
+  $("speech-server-row").hidden = speech !== "danish" && speech !== "english";
   const server = $("speech-server").value.trim() || "SERVER-IP";
   const values = SPEECH_PRESETS[speech]?.(server);
   if (values) for (const [key, value] of Object.entries(values)) $(key).value = value;
   updateSameKey();
 }
 
-// One key only makes sense when OpenAI does both; the Danish server needs none.
+// One key only makes sense when OpenAI does both; your own speech server needs none.
 function updateSameKey() {
   $("same-key").checked = $("ai-preset").value === "openai" && $("speech-preset").value === "openai";
   syncKeyFields();
@@ -348,7 +354,7 @@ async function save() {
     values.stt_key = values.llm_key;
     values.tts_key = values.llm_key;
   }
-  if ($("speech-preset").value === "danish") {
+  if (["danish", "english"].includes($("speech-preset").value)) {
     // The local speech server needs no key: erase old ones so they aren't sent to it.
     values.stt_key = "";
     values.tts_key = "";

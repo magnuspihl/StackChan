@@ -1,0 +1,95 @@
+# Speech for the StackChan kit, on your own machine: hearing (speech-to-text)
+# and a voice (text-to-speech), in Danish, English or both. The robot's AI
+# model can still be a cloud API.
+#
+# Pick the languages in .env (copy .env.example). Only those models are
+# downloaded:
+#   danish   CoRal's Røst Whisper (hearing) + Røst Chatterbox (voice), ~5 GB
+#   english  faster-distil-whisper (hearing) + Kokoro (voice), ~2 GB
+#
+# Needs an NVIDIA GPU (about 8 GB free for Danish, 3 GB for English) and the
+# NVIDIA Container Toolkit (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/).
+#
+#   cp .env.example .env     # then set COMPOSE_PROFILES
+#   docker compose up -d
+#
+# Then, in the web flasher: Speech = "My own speech server (Danish)" or
+# "(English)", address = this machine's LAN IP. Keep ports 8000/8881 on your
+# LAN; there is no login.
+
+services:
+  # Speech-to-text for both languages and the English voice (Kokoro):
+  # OpenAI-compatible /v1/audio/transcriptions and /v1/audio/speech on port 8000.
+  speech:
+    image: ghcr.io/speaches-ai/speaches:latest-cuda
+    restart: unless-stopped
+    depends_on:
+      danish-stt-model:
+        condition: service_completed_successfully
+        required: false  # only with the danish profile
+    ports:
+      - "8000:8000"
+    environment:
+      WHISPER__COMPUTE_TYPE: float16
+      STT_MODEL_TTL: "-1"  # keep models loaded: no slow first reply
+      TTS_MODEL_TTL: "-1"
+    volumes:
+      - ./data/speech:/home/ubuntu/.cache/huggingface/hub
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ---- Danish ----
+
+  # One-off: converts CoRal's official roest-v3 Whisper weights into the format
+  # speaches runs (faster-whisper / CTranslate2). Does nothing once it's done.
+  danish-stt-model:
+    profiles: [danish]
+    image: python:3.11-slim
+    volumes:
+      - ./data/speech:/hub
+      - ./stt-model/convert.sh:/convert.sh:ro
+    command: ["bash", "/convert.sh"]
+    restart: "no"
+
+  # Danish voice: OpenAI-compatible /v1/audio/speech on port 8881 (plus /speak).
+  danish-tts:
+    profiles: [danish]
+    build: ./roest-tts
+    restart: unless-stopped
+    ports:
+      - "8881:8881"
+    environment:
+      ROEST_TTS_DEFAULT_VOICE: default  # the model's own speaker; or a file name from ./voices
+      ROEST_TTS_KEEPALIVE_MINS: "60"    # unloading frees GPU memory, but the next reply takes ~1 minute
+    volumes:
+      - ./data/danish-tts:/root/.cache/huggingface
+      - ./voices:/voices:ro             # optional: ~10 s clean .wav clips; each becomes a voice
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ---- English ----
+
+  # One-off: asks speaches to download the English models.
+  english-models:
+    profiles: [english]
+    image: curlimages/curl:latest
+    restart: "no"
+    depends_on:
+      - speech
+    environment:
+      STT_MODEL: ${ENGLISH_STT_MODEL:-Systran/faster-distil-whisper-large-v3}
+      TTS_MODEL: ${ENGLISH_TTS_MODEL:-speaches-ai/Kokoro-82M-v1.0-ONNX}
+    command: >
+      sh -c "until curl -sf http://speech:8000/health >/dev/null; do sleep 2; done;
+             curl -sf -X POST http://speech:8000/v1/models/$$STT_MODEL &&
+             curl -sf -X POST http://speech:8000/v1/models/$$TTS_MODEL && echo English models ready"

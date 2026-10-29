@@ -3,3 +3,6 @@ server/data/
 # Build output and the factory firmware backup.
 firmware/out/
 *.bin
+# The speech server: downloaded models and your settings.
+speech/data/
+speech/.env

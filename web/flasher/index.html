@@ -111,14 +111,15 @@
         <div><label for="speech-preset">Speech (hearing and voice)</label>
           <select id="speech-preset">
             <option value="openai">OpenAI</option>
-            <option value="danish">My own Danish speech server</option>
+            <option value="danish">My own speech server (Danish)</option>
+            <option value="english">My own speech server (English)</option>
             <option value="custom">Custom</option>
           </select></div>
       </div>
       <div id="speech-server-row" hidden>
         <label for="speech-server">Speech server address</label>
         <input id="speech-server" placeholder="192.168.1.50">
-        <p class="muted">The computer running the Danish speech server (see <code>speech-da/</code> in the kit). Give it
+        <p class="muted">The computer running the kit's speech server (see <code>speech/</code> in the kit). Give it
           a fixed IP address on your router.</p>
       </div>
       <label class="check"><input type="checkbox" id="same-key" checked> Use the same API key for all three</label>
