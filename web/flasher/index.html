@@ -134,6 +134,8 @@
         <div><label for="llm_model">Model</label><input id="llm_model"></div>
       </div>
       <p class="muted">Needs tool calling and image input (for the camera).</p>
+      <div class="buttons"><button class="secondary" id="test-llm">Test</button></div>
+      <p id="test-llm-result" class="status"></p>
     </fieldset>
 
     <fieldset>
@@ -144,6 +146,10 @@
         <div><label for="stt_model">Model</label><input id="stt_model"></div>
         <div><label for="stt_lang">Language</label><input id="stt_lang" placeholder="en"></div>
       </div>
+      <div class="buttons"><button class="secondary" id="test-stt">Test</button></div>
+      <p class="muted">The test makes a sentence with the voice below and checks what speech-to-text hears, so the
+        voice has to work too.</p>
+      <p id="test-stt-result" class="status"></p>
     </fieldset>
 
     <fieldset>
@@ -152,10 +158,16 @@
       <div class="row">
         <div><label for="tts_key">API key</label><input id="tts_key" type="password" autocomplete="off"></div>
         <div><label for="tts_model">Model</label><input id="tts_model"></div>
-        <div><label for="tts_voice">Voice</label><input id="tts_voice"></div>
+        <div><label for="tts_voice">Voice</label><input id="tts_voice">
+          <select id="tts_voice_pick" hidden></select></div>
       </div>
       <p class="muted">Must return raw 24 kHz audio for <code>response_format: "pcm"</code>, as OpenAI does.</p>
+      <div class="buttons"><button class="secondary" id="test-tts">Test (the robot speaks)</button>
+        <button class="secondary" id="list-voices">List voices</button></div>
+      <p id="test-tts-result" class="status"></p>
     </fieldset>
+    <p class="muted">The tests run on the robot itself, with the values above (not saved yet; empty keys use the ones
+      already on the robot). It has to be on Wi-Fi in talk mode: if it is new, save once first.</p>
 
     <fieldset>
       <legend>Personality and start-up</legend>

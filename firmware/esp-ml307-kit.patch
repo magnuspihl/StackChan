@@ -1,0 +1,29 @@
+diff -ru a/src/esp/esp_tcp.cc
+--- a/src/esp/esp_tcp.cc
++++ b/src/esp/esp_tcp.cc
+@@ -73,6 +73,12 @@
+ void EspTcp::Disconnect() {
+     // 如果已经断开，直接返回
+     if (!connected_) {
++        // Kit: if the server hung up first, the receive task disconnected by
++        // itself and may still be running (calling back into the owner). Wait
++        // for it to end before anything it uses is freed.
++        if (receive_task_handle_ != nullptr) {
++            xEventGroupWaitBits(event_group_, ESP_TCP_EVENT_RECEIVE_TASK_EXIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
++        }
+         return;
+     }
+ 
+diff -ru a/src/http_client.cc
+--- a/src/http_client.cc
++++ b/src/http_client.cc
+@@ -18,6 +18,9 @@
+     if (connected_) {
+         Close();
+     }
++    // Kit: end the connection (and its receive task, which calls back into
++    // this object) before the members it uses are destroyed.
++    tcp_.reset();
+     vEventGroupDelete(event_group_handle_);
+ }
+ 

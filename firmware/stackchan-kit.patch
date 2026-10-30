@@ -1,12 +1,13 @@
 diff --git a/firmware/main/CMakeLists.txt b/firmware/main/CMakeLists.txt
-index 3680c68..bd079a0 100644
+index 3680c68..2ce1061 100644
 --- a/firmware/main/CMakeLists.txt
 +++ b/firmware/main/CMakeLists.txt
-@@ -51,6 +51,7 @@ set(SOURCES "audio/audio_codec.cc"
+@@ -51,6 +51,8 @@ set(SOURCES "audio/audio_codec.cc"
              "protocols/protocol.cc"
              "protocols/mqtt_protocol.cc"
              "protocols/websocket_protocol.cc"
 +            "protocols/local_agent_protocol.cc"
++            "protocols/kit_api.cc"
              "mcp_server.cc"
              "system_info.cc"
              "application.cc"
@@ -622,10 +623,10 @@ index 0d73851..192f411 100644
                         "Create a reminder. Duration is in seconds. Message is what to say when time is up. Set repeat "
 diff --git a/firmware/main/hal/kit_serial_config.cpp b/firmware/main/hal/kit_serial_config.cpp
 new file mode 100644
-index 0000000..8f85df7
+index 0000000..f20b8cf
 --- /dev/null
 +++ b/firmware/main/hal/kit_serial_config.cpp
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,538 @@
 +/*
 + * Kit: settings over USB, for the web flasher.
 + *
@@ -634,8 +635,13 @@ index 0000000..8f85df7
 + *   KIT {"cmd":"set","values":{"llm_key":"...","llm_model":"..."}}   ("" resets a key to its default)
 + *   KIT {"cmd":"wifi","ssid":"...","password":"..."}
 + *   KIT {"cmd":"boot_ai","on":true}   (start straight in the AI Agent)
++ *   KIT {"cmd":"test_llm" | "test_tts" | "test_stt" | "voices","values":{...}}
++ *     try settings before saving them: the robot makes the requests itself (the
++ *     flasher page can't reach LAN servers over http from https). "values" are
++ *     the unsaved form fields; anything left out comes from the robot's settings.
 + *   KIT {"cmd":"reboot"}
 + * and the robot answers with one line: KIT-REPLY {"ok":true,...} or KIT-REPLY {"ok":false,"error":"..."}.
++ * A command may carry a number "id"; the reply then carries the same "id".
 + * Secrets are never sent back; "info" only says whether a key is set.
 + * Nothing is reachable over the network: this only exists on the USB cable.
 + */
@@ -648,10 +654,18 @@ index 0000000..8f85df7
 +#include <esp_system.h>
 +#include <freertos/FreeRTOS.h>
 +#include <freertos/task.h>
++#include <freertos/semphr.h>
 +#include <ssid_manager.h>
++
++#include <esp_heap_caps.h>
++#include <esp_timer.h>
 +
 +#include <cstring>
 +#include <string>
++#include <vector>
++
++#include "application.h"
++#include "kit_api.h"
 +
 +#include "hal.h"
 +#include "settings.h"
@@ -687,8 +701,14 @@ index 0000000..8f85df7
 +    return nullptr;
 +}
 +
++// The "id" of the command being handled, echoed in its reply so the page can
++// tell a late answer to an earlier command from the one it is waiting for.
++// Commands are handled one at a time, so a single value is enough.
++double g_reply_id = -1;
++
 +void Reply(cJSON* reply)
 +{
++    if (g_reply_id >= 0) cJSON_AddNumberToObject(reply, "id", g_reply_id);
 +    char* printed    = cJSON_PrintUnformatted(reply);
 +    std::string line = std::string("\nKIT-REPLY ") + (printed ? printed : "{}") + "\n";
 +    cJSON_free(printed);
@@ -790,6 +810,273 @@ index 0000000..8f85df7
 +    Reply(reply);
 +}
 +
++// ---- Tests for the flasher: run with the form's values, before saving ----
++
++// The robot's settings with the form's (unsaved) values on top.
++kit_api::Settings TestSettings(cJSON* values)
++{
++    kit_api::Settings s = kit_api::LoadSettings();
++    auto take = [values](const char* key, std::string& field) {
++        cJSON* item = cJSON_GetObjectItem(values, key);
++        if (cJSON_IsString(item) && item->valuestring[0] != '\0') field = item->valuestring;
++    };
++    take("llm_url", s.llm.base_url);
++    take("llm_key", s.llm.key);
++    take("llm_model", s.llm.model);
++    take("tts_url", s.tts.base_url);
++    take("tts_key", s.tts.key);
++    take("tts_model", s.tts.model);
++    take("tts_voice", s.tts_voice);
++    take("stt_url", s.stt.base_url);
++    take("stt_key", s.stt.key);
++    take("stt_model", s.stt.model);
++    take("stt_lang", s.stt_language);
++    take("reply_lang", s.reply_language);
++    return s;
++}
++
++int ElapsedMs(int64_t since_us)
++{
++    return static_cast<int>((esp_timer_get_time() - since_us) / 1000);
++}
++
++std::string TestSentence(const kit_api::Settings& s)
++{
++    const bool danish = s.reply_language.rfind("Da", 0) == 0 || s.reply_language.rfind("da", 0) == 0;
++    return danish ? "Hej! Sådan lyder min stemme." : "Hello! This is how my voice sounds.";
++}
++
++// Up to 15 s of the voice's raw audio; reports the time to the first byte.
++kit_api::Result FetchSpeech(const kit_api::Settings& s, const std::string& text, std::string& pcm, int& first_ms)
++{
++    const int64_t t0 = esp_timer_get_time();
++    first_ms         = -1;
++    return kit_api::StreamSpeech(s.tts, s.tts_voice, text, 120000, [&](const char* data, int len) {
++        if (first_ms < 0) first_ms = ElapsedMs(t0);
++        pcm.append(data, len);
++        return pcm.size() < static_cast<size_t>(kit_api::kSpeechSampleRate) * 2 * 15;
++    });
++}
++
++void ReplyResultError(const kit_api::Result& result)
++{
++    ReplyError(result.error.empty() ? "No answer" : result.error);
++}
++
++void HandleTestLlm(const kit_api::Settings& s)
++{
++    cJSON* request = cJSON_CreateObject();
++    cJSON_AddStringToObject(request, "model", s.llm.model.c_str());
++    cJSON_AddNumberToObject(request, "max_tokens", 60);
++    cJSON* messages = cJSON_AddArrayToObject(request, "messages");
++    cJSON* message  = cJSON_CreateObject();
++    cJSON_AddStringToObject(message, "role", "user");
++    cJSON_AddStringToObject(message, "content", "Say hello in one short, friendly sentence.");
++    cJSON_AddItemToArray(messages, message);
++    char* printed = cJSON_PrintUnformatted(request);
++    std::string body = printed ? printed : "";
++    cJSON_free(printed);
++    cJSON_Delete(request);
++
++    const int64_t t0              = esp_timer_get_time();
++    const kit_api::Result result = kit_api::PostJson(s.llm, "/chat/completions", std::move(body), 60000);
++    if (!result.ok()) {
++        ReplyResultError(result);
++        return;
++    }
++    std::string text;
++    if (cJSON* root = cJSON_Parse(result.body.c_str())) {
++        cJSON* first   = cJSON_GetArrayItem(cJSON_GetObjectItem(root, "choices"), 0);
++        cJSON* content = cJSON_GetObjectItem(cJSON_GetObjectItem(first, "message"), "content");
++        if (cJSON_IsString(content)) text = content->valuestring;
++        cJSON_Delete(root);
++    }
++    if (text.empty()) {
++        ReplyError("The answer had no reply text: " + result.body.substr(0, 200));
++        return;
++    }
++    cJSON* reply = cJSON_CreateObject();
++    cJSON_AddBoolToObject(reply, "ok", true);
++    cJSON_AddStringToObject(reply, "text", text.c_str());
++    cJSON_AddNumberToObject(reply, "ms", ElapsedMs(t0));
++    Reply(reply);
++}
++
++void HandleTestTts(const kit_api::Settings& s)
++{
++    std::string pcm;
++    int first_ms                 = 0;
++    const int64_t t0             = esp_timer_get_time();
++    const kit_api::Result result = FetchSpeech(s, TestSentence(s), pcm, first_ms);
++    if (!result.ok()) {
++        ReplyResultError(result);
++        return;
++    }
++    const int total_ms = ElapsedMs(t0);
++    if (pcm.size() < 2000) {
++        ReplyError("The voice service sent " + std::string(pcm.empty() ? "no audio" : "almost no audio") +
++                   " for the voice \"" + s.tts_voice + "\". It may not support that voice: its log says why.");
++        return;
++    }
++    // Play it if the robot's audio is running (it is in talk mode).
++    bool played = false;
++    if (Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
++        auto& audio          = Application::GetInstance().GetAudioService();
++        const size_t samples = pcm.size() / 2;
++        const auto* data     = reinterpret_cast<const int16_t*>(pcm.data());
++        for (size_t at = 0; at < samples; at += kit_api::kSpeechSampleRate / 5) {
++            const size_t n = std::min<size_t>(kit_api::kSpeechSampleRate / 5, samples - at);
++            audio.PushPcmToPlaybackQueue(std::vector<int16_t>(data + at, data + at + n), kit_api::kSpeechSampleRate);
++        }
++        played = true;
++    }
++    cJSON* reply = cJSON_CreateObject();
++    cJSON_AddBoolToObject(reply, "ok", true);
++    cJSON_AddBoolToObject(reply, "played", played);
++    cJSON_AddNumberToObject(reply, "seconds", pcm.size() / 2.0 / kit_api::kSpeechSampleRate);
++    cJSON_AddNumberToObject(reply, "first_ms", first_ms);
++    cJSON_AddNumberToObject(reply, "ms", total_ms);
++    Reply(reply);
++}
++
++void AppendLe(std::string& out, uint32_t value, int bytes)
++{
++    for (int i = 0; i < bytes; i++) out += static_cast<char>((value >> (8 * i)) & 0xFF);
++}
++
++// Speech-to-text without the microphone: the voice says a sentence, and that
++// audio (as WAV) goes to speech-to-text. Needs working voice settings.
++void HandleTestStt(const kit_api::Settings& s)
++{
++    const std::string said = TestSentence(s);
++    std::string pcm;
++    int first_ms                 = 0;
++    const kit_api::Result speech = FetchSpeech(s, said, pcm, first_ms);
++    if (!speech.ok() || pcm.size() < 2000) {
++        ReplyError("This test needs the voice settings to work first (it makes its test speech with them). " +
++                   speech.error);
++        return;
++    }
++    std::string wav = "RIFF";
++    AppendLe(wav, 36 + pcm.size(), 4);
++    wav += "WAVEfmt ";
++    AppendLe(wav, 16, 4);
++    AppendLe(wav, 1, 2);  // PCM
++    AppendLe(wav, 1, 2);  // mono
++    AppendLe(wav, kit_api::kSpeechSampleRate, 4);
++    AppendLe(wav, kit_api::kSpeechSampleRate * 2, 4);
++    AppendLe(wav, 2, 2);
++    AppendLe(wav, 16, 2);
++    wav += "data";
++    AppendLe(wav, pcm.size(), 4);
++    wav += pcm;
++    pcm.clear();
++
++    const int64_t t0             = esp_timer_get_time();
++    const kit_api::Result result = kit_api::Transcribe(s.stt, s.stt_language, std::move(wav), "test.wav", "audio/wav", 60000);
++    if (!result.ok()) {
++        ReplyResultError(result);
++        return;
++    }
++    std::string heard;
++    if (cJSON* root = cJSON_Parse(result.body.c_str())) {
++        cJSON* text = cJSON_GetObjectItem(root, "text");
++        if (cJSON_IsString(text)) heard = text->valuestring;
++        cJSON_Delete(root);
++    }
++    cJSON* reply = cJSON_CreateObject();
++    cJSON_AddBoolToObject(reply, "ok", true);
++    cJSON_AddStringToObject(reply, "said", said.c_str());
++    cJSON_AddStringToObject(reply, "heard", heard.c_str());
++    cJSON_AddNumberToObject(reply, "ms", ElapsedMs(t0));
++    Reply(reply);
++}
++
++// The voices a self-hosted voice server offers: speaches lists them per model
++// (/v1/models/<model>), roest-tts at /voices. (OpenAI's are fixed; the page knows them.)
++void HandleVoices(const kit_api::Settings& s)
++{
++    std::vector<std::string> names;
++    kit_api::Result result = kit_api::Get(kit_api::JoinUrl(s.tts.base_url, ("/models/" + s.tts.model).c_str()),
++                                          s.tts.key, 15000);
++    if (result.ok()) {
++        if (cJSON* root = cJSON_Parse(result.body.c_str())) {
++            cJSON* voice = nullptr;
++            cJSON_ArrayForEach(voice, cJSON_GetObjectItem(root, "voices"))
++            {
++                cJSON* name = cJSON_GetObjectItem(voice, "name");
++                if (cJSON_IsString(name)) names.push_back(name->valuestring);
++            }
++            cJSON_Delete(root);
++        }
++    }
++    if (names.empty()) {
++        std::string origin = s.tts.base_url;
++        while (!origin.empty() && origin.back() == '/') origin.pop_back();
++        if (origin.size() > 3 && origin.compare(origin.size() - 3, 3, "/v1") == 0) origin.resize(origin.size() - 3);
++        result = kit_api::Get(origin + "/voices", s.tts.key, 15000);
++        if (result.ok()) {
++            if (cJSON* root = cJSON_Parse(result.body.c_str())) {
++                cJSON* voice = nullptr;
++                cJSON_ArrayForEach(voice, cJSON_GetObjectItem(root, "voices"))
++                {
++                    cJSON* id = cJSON_GetObjectItem(voice, "id");
++                    if (cJSON_IsString(id)) names.push_back(id->valuestring);
++                }
++                cJSON_Delete(root);
++            }
++        }
++    }
++    if (names.empty()) {
++        ReplyError("This voice service doesn't list its voices" + (result.error.empty() ? "" : ": " + result.error));
++        return;
++    }
++    cJSON* reply = cJSON_CreateObject();
++    cJSON_AddBoolToObject(reply, "ok", true);
++    cJSON* list = cJSON_AddArrayToObject(reply, "voices");
++    for (const auto& name : names) cJSON_AddItemToArray(list, cJSON_CreateString(name.c_str()));
++    Reply(reply);
++}
++
++// Tests make HTTPS requests, which need a roomy stack. Internal RAM is scarce
++// and a task with its stack in PSRAM must not touch flash (the settings), so
++// the settings are read here and only the requests run in a PSRAM-stack task.
++struct TestJob {
++    std::string command;
++    kit_api::Settings settings;
++    SemaphoreHandle_t done;
++};
++
++void TestTask(void* arg)
++{
++    auto* job = static_cast<TestJob*>(arg);
++    if (job->command == "test_llm") {
++        HandleTestLlm(job->settings);
++    } else if (job->command == "test_tts") {
++        HandleTestTts(job->settings);
++    } else if (job->command == "test_stt") {
++        HandleTestStt(job->settings);
++    } else if (job->command == "voices") {
++        HandleVoices(job->settings);
++    } else {
++        ReplyError("unknown command: " + job->command);
++    }
++    xSemaphoreGive(job->done);
++    vTaskDeleteWithCaps(nullptr);
++}
++
++void RunTest(const char* command, kit_api::Settings settings)
++{
++    TestJob job{command, std::move(settings), xSemaphoreCreateBinary()};
++    if (job.done == nullptr || xTaskCreatePinnedToCoreWithCaps(TestTask, "kit_test", 16 * 1024, &job, 2, nullptr,
++                                                               tskNO_AFFINITY, MALLOC_CAP_SPIRAM) != pdPASS) {
++        ReplyError("Not enough memory to run the test");
++    } else {
++        xSemaphoreTake(job.done, portMAX_DELAY);
++    }
++    if (job.done) vSemaphoreDelete(job.done);
++}
++
 +void HandleLine(const std::string& line)
 +{
 +    if (line.rfind(kPrefix, 0) != 0) {
@@ -797,6 +1084,8 @@ index 0000000..8f85df7
 +    }
 +    cJSON* root = cJSON_Parse(line.c_str() + strlen(kPrefix));
 +    cJSON* cmd  = cJSON_GetObjectItem(root, "cmd");
++    cJSON* id   = cJSON_GetObjectItem(root, "id");
++    g_reply_id  = cJSON_IsNumber(id) ? id->valuedouble : -1;
 +    if (!cJSON_IsString(cmd)) {
 +        ReplyError("expected KIT {\"cmd\":...}");
 +    } else if (strcmp(cmd->valuestring, "info") == 0) {
@@ -816,6 +1105,8 @@ index 0000000..8f85df7
 +            cJSON_AddBoolToObject(reply, "ok", true);
 +            Reply(reply);
 +        }
++    } else if (strncmp(cmd->valuestring, "test_", 5) == 0 || strcmp(cmd->valuestring, "voices") == 0) {
++        RunTest(cmd->valuestring, TestSettings(cJSON_GetObjectItem(root, "values")));
 +    } else if (strcmp(cmd->valuestring, "wifi") == 0) {
 +        HandleWifi(root);
 +    } else if (strcmp(cmd->valuestring, "reboot") == 0) {

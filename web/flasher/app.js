@@ -74,13 +74,16 @@ class RobotLink {
   constructor(serialPort) {
     this.port = serialPort;
     this.buffer = "";
-    this.waiters = [];
+    this.waiters = new Map(); // command id -> resolve
+    this.nextId = 1;
   }
 
   async open() {
     await this.port.open({ baudRate: 115200 });
-    // Leave the reset lines alone so opening the port doesn't restart the robot.
-    await this.port.setSignals({ dataTerminalReady: false, requestToSend: false }).catch(() => {});
+    // Release the control lines without restarting the robot: on the ESP32-S3's
+    // USB port, RTS on with DTR off means "reset", so RTS goes off first.
+    await this.port.setSignals({ requestToSend: false }).catch(() => {});
+    await this.port.setSignals({ dataTerminalReady: false }).catch(() => {});
     this.writer = this.port.writable.getWriter();
     this.reader = this.port.readable.getReader();
     this.pump = this.readLoop();
@@ -98,7 +101,15 @@ class RobotLink {
           const line = this.buffer.slice(0, nl).replace(/\r$/, "");
           this.buffer = this.buffer.slice(nl + 1);
           const at = line.indexOf("KIT-REPLY ");
-          if (at >= 0 && this.waiters.length) this.waiters.shift()(line.slice(at + 10));
+          if (at < 0) continue;
+          let reply;
+          try { reply = JSON.parse(line.slice(at + 10)); } catch (_) { continue; }
+          // Only the command it belongs to; late answers to earlier ones are dropped.
+          const resolve = this.waiters.get(reply.id);
+          if (resolve) {
+            this.waiters.delete(reply.id);
+            resolve(reply);
+          }
         }
       }
     } catch (_) {
@@ -108,16 +119,16 @@ class RobotLink {
 
   // One command, one reply. Rejects on timeout.
   async send(command, timeoutMs = 4000) {
+    const id = this.nextId++;
     const reply = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.waiters = this.waiters.filter((w) => w !== done);
+        this.waiters.delete(id);
         reject(new Error("The robot did not answer"));
       }, timeoutMs);
-      const done = (text) => { clearTimeout(timer); resolve(text); };
-      this.waiters.push(done);
+      this.waiters.set(id, (parsed) => { clearTimeout(timer); resolve(parsed); });
     });
-    await this.writer.write(new TextEncoder().encode("KIT " + JSON.stringify(command) + "\n"));
-    const parsed = JSON.parse(await reply);
+    await this.writer.write(new TextEncoder().encode("KIT " + JSON.stringify({ ...command, id }) + "\n"));
+    const parsed = await reply;
     if (!parsed.ok) throw new Error("The robot said: " + parsed.error);
     return parsed;
   }
@@ -305,6 +316,7 @@ function applySpeechPreset() {
   const server = $("speech-server").value.trim() || "SERVER-IP";
   const values = SPEECH_PRESETS[speech]?.(server);
   if (values) for (const [key, value] of Object.entries(values)) $(key).value = value;
+  forgetVoices();
   updateSameKey();
 }
 
@@ -331,6 +343,7 @@ function showCurrent(info) {
   $("boot_ai").checked = !!info.boot_ai;
   // Show stored values; empty means the firmware's default is in use.
   for (const key of PLAIN_KEYS) if (s[key]) $(key).value = s[key];
+  forgetVoices();
   log("Read the robot's settings.");
 }
 
@@ -340,7 +353,8 @@ async function readSettings() {
   showCurrent(info);
 }
 
-async function save() {
+// The form's values as the robot stores them (empty fields left out).
+function formValues() {
   const values = {};
   for (const key of PLAIN_KEYS) {
     const v = $(key).value.trim();
@@ -354,6 +368,71 @@ async function save() {
     values.stt_key = values.llm_key;
     values.tts_key = values.llm_key;
   }
+  return values;
+}
+
+// ---------- tests (run by the robot: the page can't reach http LAN servers) ----------
+
+const OPENAI_VOICES = ["alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse"];
+
+// A speech server that has just started (or unloaded its models) can take minutes to answer the first time.
+const SLOW_START = " A speech server that is just starting can take a few minutes.";
+
+async function robotTest(command, resultId, hint = "") {
+  setStatus(resultId, `Testing on the robot…${hint}`);
+  return withRobot(async (link) => {
+    await link.waitUntilReady(8000);
+    return link.send({ cmd: command, values: formValues() }, 150000);
+  });
+}
+
+async function testLlm() {
+  const r = await robotTest("test_llm", "test-llm-result");
+  setStatus("test-llm-result", `OK in ${(r.ms / 1000).toFixed(1)} s: “${r.text}”`, "ok");
+}
+
+async function testStt() {
+  const r = await robotTest("test_stt", "test-stt-result", SLOW_START);
+  const kind = r.heard.trim() ? "ok" : "bad";
+  setStatus("test-stt-result", `Said “${r.said}”, heard “${r.heard}” (${(r.ms / 1000).toFixed(1)} s)`, kind);
+}
+
+async function testTts() {
+  const r = await robotTest("test_tts", "test-tts-result", SLOW_START);
+  const where = r.played ? "The robot just said it." : "Open talk mode on the robot to hear it.";
+  setStatus("test-tts-result",
+    `OK: ${r.seconds.toFixed(1)} s of speech, first sound after ${(r.first_ms / 1000).toFixed(1)} s. ${where}`, "ok");
+}
+
+// Once the server has listed its voices, the Voice field becomes a dropdown of them; the text field
+// (which save and the tests read) follows it. Changing the voice server turns it back into a text field.
+function showVoices(voices) {
+  const pick = $("tts_voice_pick");
+  pick.replaceChildren(...voices.map((v) => Object.assign(document.createElement("option"), { value: v, textContent: v })));
+  if (voices.includes($("tts_voice").value.trim())) pick.value = $("tts_voice").value.trim();
+  $("tts_voice").value = pick.value;
+  pick.hidden = false;
+  $("tts_voice").hidden = true;
+  setStatus("test-tts-result", `${voices.length} voices: pick one in the Voice field.`, "ok");
+}
+
+function forgetVoices() {
+  $("tts_voice_pick").hidden = true;
+  $("tts_voice_pick").replaceChildren();
+  $("tts_voice").hidden = false;
+}
+
+async function listVoices() {
+  if (/api\.openai\.com/.test($("tts_url").value)) {
+    showVoices(OPENAI_VOICES);
+    return;
+  }
+  const r = await robotTest("voices", "test-tts-result", SLOW_START);
+  showVoices(r.voices);
+}
+
+async function save() {
+  const values = formValues();
   if (["danish", "english"].includes($("speech-preset").value)) {
     // The local speech server needs no key: erase old ones so they aren't sent to it.
     values.stt_key = "";
@@ -398,12 +477,18 @@ if (!("serial" in navigator)) {
 $("connect").addEventListener("click", () => run("connect-status", connect));
 $("flash").addEventListener("click", () => run("flash-status", flash));
 $("restore").addEventListener("click", () => run("restore-status", restore));
+$("test-llm").addEventListener("click", () => run("test-llm-result", testLlm));
+$("test-stt").addEventListener("click", () => run("test-stt-result", testStt));
+$("test-tts").addEventListener("click", () => run("test-tts-result", testTts));
+$("list-voices").addEventListener("click", () => run("test-tts-result", listVoices));
 $("read").addEventListener("click", () => run("save-status", readSettings));
 $("save").addEventListener("click", () => run("save-status", save));
 $("ai-preset").addEventListener("change", applyAiPreset);
 $("speech-preset").addEventListener("change", applySpeechPreset);
 $("speech-server").addEventListener("input", applySpeechPreset);
 $("same-key").addEventListener("change", syncKeyFields);
+$("tts_voice_pick").addEventListener("change", () => { $("tts_voice").value = $("tts_voice_pick").value; });
+for (const key of ["tts_url", "tts_key", "tts_model"]) $(key).addEventListener("input", forgetVoices);
 $("persona-default").addEventListener("click", (event) => {
   event.preventDefault();
   $("persona").value = "";

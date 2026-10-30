@@ -189,12 +189,239 @@ index 9e73014..03e8573 100644
  #include <chrono>
  
  class Theme {
+diff --git a/main/protocols/kit_api.cc b/main/protocols/kit_api.cc
+new file mode 100644
+index 0000000..c019773
+--- /dev/null
++++ b/main/protocols/kit_api.cc
+@@ -0,0 +1,161 @@
++#include "kit_api.h"
++
++#include <sdkconfig.h>
++
++// Only built for the on-device kit firmware (its settings exist only then).
++#if CONFIG_KIT_LOCAL_AGENT
++
++#include "board.h"
++#include "settings.h"
++
++#include <cJSON.h>
++#include <esp_log.h>
++
++#include <memory>
++
++#define TAG "KitApi"
++
++namespace kit_api {
++
++namespace {
++
++std::unique_ptr<Http> NewRequest(int timeout_ms) {
++    auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
++    // esp-ml307 frees badly if the server hangs up first (its receive task
++    // calls back into the freed client), so keep the connection open and
++    // always close it from our side.
++    http->SetKeepAlive(true);
++    http->SetTimeout(timeout_ms);
++    return http;
++}
++
++void Authorize(Http& http, const std::string& key) {
++    if (!key.empty()) http.SetHeader("Authorization", "Bearer " + key);
++}
++
++// Opens the request and reads the status; the body is left for the caller.
++bool Send(Http& http, const char* method, const std::string& url, Result& result) {
++    if (!http.Open(method, url)) {
++        result.error = "Cannot connect to " + url;
++        ESP_LOGE(TAG, "%s", result.error.c_str());
++        return false;
++    }
++    result.status = http.GetStatusCode();
++    return true;
++}
++
++void SetHttpError(Result& result, const std::string& url, const std::string& body) {
++    // Keep the start of the server's message: it usually says what is wrong.
++    result.error = "HTTP " + std::to_string(result.status) + " from " + url + ": " + body.substr(0, 300);
++    ESP_LOGE(TAG, "%s", result.error.c_str());
++}
++
++Result Finish(std::unique_ptr<Http> http, const std::string& url, Result result) {
++    result.body = http->ReadAll();
++    http->Close();
++    if (!result.ok()) SetHttpError(result, url, result.body);
++    return result;
++}
++
++}  // namespace
++
++Settings LoadSettings() {
++    ::Settings nvs("kit", false);
++    Settings s;
++    s.llm = {nvs.GetString("llm_url", CONFIG_KIT_LLM_BASE_URL), nvs.GetString("llm_key", CONFIG_KIT_LLM_KEY),
++             nvs.GetString("llm_model", CONFIG_KIT_LLM_MODEL)};
++    s.tts = {nvs.GetString("tts_url", CONFIG_KIT_TTS_BASE_URL), nvs.GetString("tts_key", CONFIG_KIT_TTS_KEY),
++             nvs.GetString("tts_model", CONFIG_KIT_TTS_MODEL)};
++    s.stt = {nvs.GetString("stt_url", CONFIG_KIT_STT_BASE_URL), nvs.GetString("stt_key", CONFIG_KIT_STT_KEY),
++             nvs.GetString("stt_model", CONFIG_KIT_STT_MODEL)};
++    s.tts_voice = nvs.GetString("tts_voice", CONFIG_KIT_TTS_VOICE);
++    s.stt_language = nvs.GetString("stt_lang", CONFIG_KIT_STT_LANGUAGE);
++    s.reply_language = nvs.GetString("reply_lang", CONFIG_KIT_REPLY_LANGUAGE);
++    return s;
++}
++
++std::string JoinUrl(const std::string& base, const char* path) {
++    std::string url = base;
++    while (!url.empty() && url.back() == '/') url.pop_back();
++    return url + path;
++}
++
++Result PostJson(const Endpoint& endpoint, const char* path, std::string body, int timeout_ms) {
++    const std::string url = JoinUrl(endpoint.base_url, path);
++    auto http = NewRequest(timeout_ms);
++    http->SetHeader("Content-Type", "application/json");
++    Authorize(*http, endpoint.key);
++    http->SetContent(std::move(body));
++    Result result;
++    if (!Send(*http, "POST", url, result)) return result;
++    return Finish(std::move(http), url, result);
++}
++
++Result Get(const std::string& url, const std::string& key, int timeout_ms) {
++    auto http = NewRequest(timeout_ms);
++    Authorize(*http, key);
++    Result result;
++    if (!Send(*http, "GET", url, result)) return result;
++    return Finish(std::move(http), url, result);
++}
++
++Result Transcribe(const Endpoint& endpoint, const std::string& language, std::string audio,
++                  const char* filename, const char* mime_type, int timeout_ms) {
++    const std::string boundary = "----stackchankit7MA4YWxk";
++    std::string body;
++    auto field = [&](const char* name, const std::string& value) {
++        if (value.empty()) return;
++        body += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + name + "\"\r\n\r\n" + value + "\r\n";
++    };
++    field("model", endpoint.model);
++    field("language", language);
++    field("response_format", "json");
++    body += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"" + filename +
++            "\"\r\nContent-Type: " + mime_type + "\r\n\r\n";
++    body += audio;
++    audio.clear();
++    body += "\r\n--" + boundary + "--\r\n";
++
++    const std::string url = JoinUrl(endpoint.base_url, "/audio/transcriptions");
++    auto http = NewRequest(timeout_ms);
++    http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
++    Authorize(*http, endpoint.key);
++    http->SetContent(std::move(body));
++    Result result;
++    if (!Send(*http, "POST", url, result)) return result;
++    return Finish(std::move(http), url, result);
++}
++
++Result StreamSpeech(const Endpoint& endpoint, const std::string& voice, const std::string& text,
++                    int timeout_ms, const std::function<bool(const char* data, int len)>& on_data) {
++    cJSON* request = cJSON_CreateObject();
++    cJSON_AddStringToObject(request, "model", endpoint.model.c_str());
++    cJSON_AddStringToObject(request, "voice", voice.c_str());
++    cJSON_AddStringToObject(request, "input", text.c_str());
++    cJSON_AddStringToObject(request, "response_format", "pcm");
++    char* printed = cJSON_PrintUnformatted(request);
++    std::string body = printed ? printed : "";
++    cJSON_free(printed);
++    cJSON_Delete(request);
++
++    const std::string url = JoinUrl(endpoint.base_url, "/audio/speech");
++    auto http = NewRequest(timeout_ms);
++    http->SetHeader("Content-Type", "application/json");
++    Authorize(*http, endpoint.key);
++    http->SetContent(std::move(body));
++    Result result;
++    if (!Send(*http, "POST", url, result)) return result;
++    if (!result.ok()) return Finish(std::move(http), url, result);
++
++    char buffer[2048];
++    for (;;) {
++        const int n = http->Read(buffer, sizeof(buffer));
++        if (n <= 0 || !on_data(buffer, n)) break;
++    }
++    http->Close();
++    return result;
++}
++
++}  // namespace kit_api
++
++#endif  // CONFIG_KIT_LOCAL_AGENT
+diff --git a/main/protocols/kit_api.h b/main/protocols/kit_api.h
+new file mode 100644
+index 0000000..12a45d2
+--- /dev/null
++++ b/main/protocols/kit_api.h
+@@ -0,0 +1,54 @@
++#ifndef KIT_API_H
++#define KIT_API_H
++
++// Kit: the OpenAI-style HTTP calls the on-device agent makes (chat, speech-to-
++// text, text-to-speech), shared by the agent and the web flasher's tests.
++
++#include <functional>
++#include <string>
++
++namespace kit_api {
++
++struct Endpoint {
++    std::string base_url;  // e.g. https://api.openai.com/v1
++    std::string key;       // empty: no Authorization header
++    std::string model;
++};
++
++struct Result {
++    int status = 0;     // HTTP status, 0 if there was no answer
++    std::string body;   // response body (not for StreamSpeech)
++    std::string error;  // short, human-readable, when !ok()
++    bool ok() const { return status == 200; }
++};
++
++// What the robot has stored (NVS namespace "kit"), over the build defaults.
++struct Settings {
++    Endpoint llm;
++    Endpoint tts;
++    Endpoint stt;
++    std::string tts_voice;
++    std::string stt_language;
++    std::string reply_language;
++};
++Settings LoadSettings();
++
++constexpr int kSpeechSampleRate = 24000;  // "pcm" from the speech APIs: 16-bit mono
++
++std::string JoinUrl(const std::string& base, const char* path);
++
++Result PostJson(const Endpoint& endpoint, const char* path, std::string body, int timeout_ms);
++Result Get(const std::string& url, const std::string& key, int timeout_ms);
++
++// POST /audio/transcriptions with one audio file (multipart).
++Result Transcribe(const Endpoint& endpoint, const std::string& language, std::string audio,
++                  const char* filename, const char* mime_type, int timeout_ms);
++
++// POST /audio/speech with response_format "pcm" and stream the raw audio:
++// on_data gets each piece as it arrives and returns false to stop early.
++Result StreamSpeech(const Endpoint& endpoint, const std::string& voice, const std::string& text,
++                    int timeout_ms, const std::function<bool(const char* data, int len)>& on_data);
++
++}  // namespace kit_api
++
++#endif  // KIT_API_H
 diff --git a/main/protocols/local_agent_protocol.cc b/main/protocols/local_agent_protocol.cc
 new file mode 100644
-index 0000000..86b0f38
+index 0000000..057d1f2
 --- /dev/null
 +++ b/main/protocols/local_agent_protocol.cc
-@@ -0,0 +1,974 @@
+@@ -0,0 +1,870 @@
 +#include "local_agent_protocol.h"
 +
 +#include <sdkconfig.h>
@@ -442,12 +669,6 @@ index 0000000..86b0f38
 +    return first == std::string::npos ? "" : s.substr(first, last - first + 1);
 +}
 +
-+std::string JoinUrl(const std::string& base, const char* path) {
-+    std::string url = base;
-+    while (!url.empty() && url.back() == '/') url.pop_back();
-+    return url + path;
-+}
-+
 +// Drops emoji, pictographs and markdown emphasis, which the voice would read out.
 +std::string SpeakableText(const std::string& s) {
 +    std::string out;
@@ -492,16 +713,8 @@ index 0000000..86b0f38
 +
 +void LocalAgentProtocol::LoadSettings() {
 +    // NVS namespace "kit" (written by the web flasher) overrides build defaults.
++    static_cast<kit_api::Settings&>(settings_) = kit_api::LoadSettings();
 +    ::Settings nvs("kit", false);
-+    settings_.llm = {nvs.GetString("llm_url", CONFIG_KIT_LLM_BASE_URL), nvs.GetString("llm_key", CONFIG_KIT_LLM_KEY),
-+                     nvs.GetString("llm_model", CONFIG_KIT_LLM_MODEL)};
-+    settings_.tts = {nvs.GetString("tts_url", CONFIG_KIT_TTS_BASE_URL), nvs.GetString("tts_key", CONFIG_KIT_TTS_KEY),
-+                     nvs.GetString("tts_model", CONFIG_KIT_TTS_MODEL)};
-+    settings_.stt = {nvs.GetString("stt_url", CONFIG_KIT_STT_BASE_URL), nvs.GetString("stt_key", CONFIG_KIT_STT_KEY),
-+                     nvs.GetString("stt_model", CONFIG_KIT_STT_MODEL)};
-+    settings_.tts_voice = nvs.GetString("tts_voice", CONFIG_KIT_TTS_VOICE);
-+    settings_.stt_language = nvs.GetString("stt_lang", CONFIG_KIT_STT_LANGUAGE);
-+    settings_.reply_language = nvs.GetString("reply_lang", CONFIG_KIT_REPLY_LANGUAGE);
 +    // "prompt" replaces everything (experts only); "persona" just the character.
 +    const std::string base = nvs.GetString("prompt", "");
 +    settings_.prompt = (base.empty() ? nvs.GetString("persona", kDefaultPersona) + "\n\n" + kRules : base) +
@@ -720,75 +933,16 @@ index 0000000..86b0f38
 +}
 +
 +std::string LocalAgentProtocol::Transcribe(const std::string& ogg) {
-+    const std::string boundary = "----stackchankit7MA4YWxk";
-+    std::string body;
-+    auto field = [&](const char* name, const std::string& value) {
-+        if (value.empty()) return;
-+        body += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + name + "\"\r\n\r\n" + value + "\r\n";
-+    };
-+    field("model", settings_.stt.model);
-+    field("language", settings_.stt_language);
-+    field("response_format", "json");
-+    body += "--" + boundary +
-+            "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"speech.ogg\"\r\n"
-+            "Content-Type: audio/ogg\r\n\r\n";
-+    body += ogg;
-+    body += "\r\n--" + boundary + "--\r\n";
-+
-+    const std::string url = JoinUrl(settings_.stt.base_url, "/audio/transcriptions");
-+    auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
-+    // esp-ml307 frees badly if the server hangs up first (its receive task
-+    // calls back into the freed client), so keep the connection open and
-+    // always close it from our side.
-+    http->SetKeepAlive(true);
-+    http->SetTimeout(30000);
-+    http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
-+    if (!settings_.stt.key.empty()) http->SetHeader("Authorization", "Bearer " + settings_.stt.key);
-+    http->SetContent(std::move(body));
-+    if (!http->Open("POST", url)) {
-+        ESP_LOGE(TAG, "STT: cannot connect to %s", url.c_str());
-+        return "";
-+    }
-+    const int status = http->GetStatusCode();
-+    std::string response = http->ReadAll();
-+    http->Close();
-+    if (status != 200) {
-+        ESP_LOGE(TAG, "STT HTTP %d: %.200s", status, response.c_str());
-+        return "";
-+    }
++    const kit_api::Result result =
++        kit_api::Transcribe(settings_.stt, settings_.stt_language, ogg, "speech.ogg", "audio/ogg", 30000);
++    if (!result.ok()) return "";
 +    std::string text;
-+    if (cJSON* root = cJSON_Parse(response.c_str())) {
++    if (cJSON* root = cJSON_Parse(result.body.c_str())) {
 +        auto t = cJSON_GetObjectItem(root, "text");
 +        if (cJSON_IsString(t)) text = t->valuestring;
 +        cJSON_Delete(root);
 +    }
 +    return Trim(text);  // Whisper likes to add whitespace
-+}
-+
-+std::string LocalAgentProtocol::PostJson(const Endpoint& endpoint, const char* path, std::string body,
-+                                         int timeout_ms) {
-+    const std::string url = JoinUrl(endpoint.base_url, path);
-+    auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
-+    // esp-ml307 frees badly if the server hangs up first (its receive task
-+    // calls back into the freed client), so keep the connection open and
-+    // always close it from our side.
-+    http->SetKeepAlive(true);
-+    http->SetTimeout(timeout_ms);
-+    http->SetHeader("Content-Type", "application/json");
-+    if (!endpoint.key.empty()) http->SetHeader("Authorization", "Bearer " + endpoint.key);
-+    http->SetContent(std::move(body));
-+    if (!http->Open("POST", url)) {
-+        ESP_LOGE(TAG, "Cannot connect to %s", url.c_str());
-+        return "";
-+    }
-+    const int status = http->GetStatusCode();
-+    std::string response = http->ReadAll();
-+    http->Close();
-+    if (status != 200) {
-+        ESP_LOGE(TAG, "%s: HTTP %d: %.300s", path, status, response.c_str());
-+        return "";
-+    }
-+    return response;
 +}
 +
 +std::string LocalAgentProtocol::McpRequest(const std::string& method, const std::string& params_json,
@@ -955,7 +1109,7 @@ index 0000000..86b0f38
 +        cJSON_free(printed);
 +        cJSON_Delete(request);
 +
-+        cJSON* root = cJSON_Parse(PostJson(settings_.llm, "/chat/completions", std::move(body), 60000).c_str());
++        cJSON* root = cJSON_Parse(kit_api::PostJson(settings_.llm, "/chat/completions", std::move(body), 60000).body.c_str());
 +        cJSON* choices = cJSON_GetObjectItem(root, "choices");
 +        cJSON* message = cJSON_GetObjectItem(cJSON_GetArrayItem(choices, 0), "message");
 +        if (!cJSON_IsObject(message)) {
@@ -1030,37 +1184,6 @@ index 0000000..86b0f38
 +    if (text.empty() || !on_incoming_pcm_) return;
 +    const int64_t t0 = esp_timer_get_time();
 +
-+    cJSON* request = cJSON_CreateObject();
-+    cJSON_AddStringToObject(request, "model", settings_.tts.model.c_str());
-+    cJSON_AddStringToObject(request, "voice", settings_.tts_voice.c_str());
-+    cJSON_AddStringToObject(request, "input", text.c_str());
-+    cJSON_AddStringToObject(request, "response_format", "pcm");
-+    char* printed = cJSON_PrintUnformatted(request);
-+    std::string body = printed ? printed : "";
-+    cJSON_free(printed);
-+    cJSON_Delete(request);
-+
-+    const std::string url = JoinUrl(settings_.tts.base_url, "/audio/speech");
-+    auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
-+    // esp-ml307 frees badly if the server hangs up first (its receive task
-+    // calls back into the freed client), so keep the connection open and
-+    // always close it from our side.
-+    http->SetKeepAlive(true);
-+    http->SetTimeout(120000);  // a local voice server may first have to load its model
-+    http->SetHeader("Content-Type", "application/json");
-+    if (!settings_.tts.key.empty()) http->SetHeader("Authorization", "Bearer " + settings_.tts.key);
-+    http->SetContent(std::move(body));
-+    if (!http->Open("POST", url)) {
-+        ESP_LOGE(TAG, "TTS: cannot connect to %s", url.c_str());
-+        return;
-+    }
-+    const int status = http->GetStatusCode();
-+    if (status != 200) {
-+        ESP_LOGE(TAG, "TTS HTTP %d: %.200s", status, http->ReadAll().c_str());
-+        http->Close();
-+        return;
-+    }
-+
 +    // Chunks wait here until the pre-buffer is full (or the stream ends).
 +    std::vector<std::vector<int16_t>> pending;
 +    bool started = false;
@@ -1099,33 +1222,33 @@ index 0000000..86b0f38
 +    chunk.reserve(kTtsChunkSamples);
 +    int odd_byte = -1;  // PCM can arrive split mid-sample
 +    size_t total_bytes = 0;
-+    char buffer[2048];
-+    while (playing) {
-+        const int n = http->Read(buffer, sizeof(buffer));
-+        if (n <= 0) break;
-+        total_bytes += n;
-+        int i = 0;
-+        if (odd_byte >= 0) {
-+            chunk.push_back(static_cast<int16_t>(odd_byte | (static_cast<uint8_t>(buffer[0]) << 8)));
-+            odd_byte = -1;
-+            i = 1;
-+        }
-+        for (; i + 1 < n; i += 2) {
-+            chunk.push_back(static_cast<int16_t>(static_cast<uint8_t>(buffer[i]) |
-+                                                 (static_cast<uint8_t>(buffer[i + 1]) << 8)));
-+            if (chunk.size() == kTtsChunkSamples) {
-+                pending.push_back(std::move(chunk));
-+                chunk = {};
-+                chunk.reserve(kTtsChunkSamples);
-+                if (started || pending.size() >= kTtsPrebufferChunks) flush();
-+                if (!playing) break;
++    // A local voice server may first have to load its model: allow 2 minutes.
++    const kit_api::Result result = kit_api::StreamSpeech(
++        settings_.tts, settings_.tts_voice, text, 120000, [&](const char* buffer, int n) {
++            total_bytes += n;
++            int i = 0;
++            if (odd_byte >= 0) {
++                chunk.push_back(static_cast<int16_t>(odd_byte | (static_cast<uint8_t>(buffer[0]) << 8)));
++                odd_byte = -1;
++                i = 1;
 +            }
-+        }
-+        if (playing && i < n) odd_byte = static_cast<uint8_t>(buffer[i]);
-+    }
++            for (; i + 1 < n; i += 2) {
++                chunk.push_back(static_cast<int16_t>(static_cast<uint8_t>(buffer[i]) |
++                                                     (static_cast<uint8_t>(buffer[i + 1]) << 8)));
++                if (chunk.size() == kTtsChunkSamples) {
++                    pending.push_back(std::move(chunk));
++                    chunk = {};
++                    chunk.reserve(kTtsChunkSamples);
++                    if (started || pending.size() >= kTtsPrebufferChunks) flush();
++                    if (!playing) return false;
++                }
++            }
++            if (i < n) odd_byte = static_cast<uint8_t>(buffer[i]);
++            return true;
++        });
++    if (!result.ok()) return;
 +    if (playing && !chunk.empty()) pending.push_back(std::move(chunk));
 +    if (playing) flush();
-+    http->Close();
 +    // The queue may still hold up to 2 s, and the app reconfigures the audio
 +    // hardware for listening as soon as the queue is empty, cutting the last
 +    // piece short. So end the speaking state only once it has really played.
@@ -1171,13 +1294,14 @@ index 0000000..86b0f38
 +#endif  // CONFIG_KIT_LOCAL_AGENT
 diff --git a/main/protocols/local_agent_protocol.h b/main/protocols/local_agent_protocol.h
 new file mode 100644
-index 0000000..77cfd63
+index 0000000..41a45f0
 --- /dev/null
 +++ b/main/protocols/local_agent_protocol.h
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,103 @@
 +#ifndef LOCAL_AGENT_PROTOCOL_H
 +#define LOCAL_AGENT_PROTOCOL_H
 +
++#include "kit_api.h"
 +#include "protocol.h"
 +
 +#include <freertos/FreeRTOS.h>
@@ -1215,18 +1339,7 @@ index 0000000..77cfd63
 +    bool SendText(const std::string& text) override;
 +
 +private:
-+    struct Endpoint {
-+        std::string base_url;
-+        std::string key;
-+        std::string model;
-+    };
-+    struct Settings {
-+        Endpoint llm;
-+        Endpoint tts;
-+        Endpoint stt;
-+        std::string tts_voice;
-+        std::string stt_language;
-+        std::string reply_language;
++    struct Settings : kit_api::Settings {
 +        std::string prompt;  // includes the reply-language line
 +    };
 +
@@ -1237,7 +1350,6 @@ index 0000000..77cfd63
 +    void ProcessUtterance(std::vector<std::vector<uint8_t>> packets);
 +    std::string Transcribe(const std::string& ogg);
 +    std::string Chat(const std::string& user_text);
-+    std::string PostJson(const Endpoint& endpoint, const char* path, std::string body, int timeout_ms);
 +    std::string CallTool(const std::string& name, const std::string& arguments);
 +    // Streams the reply's speech; on_first_audio runs once, just before sound starts.
 +    void Speak(const std::string& text, const std::function<void()>& on_first_audio);

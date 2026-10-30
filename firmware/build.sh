@@ -53,6 +53,10 @@ docker run --rm \
 
     python3 fetch_repos.py
     git -C xiaozhi-esp32 apply /kit/xiaozhi-kit.patch
+    # Download the managed components, then fix a crash in the network library
+    # (a plain-http server that hangs up first).
+    idf.py reconfigure
+    patch -p1 -d managed_components/78__esp-ml307 < /kit/esp-ml307-kit.patch
     idf.py build
 
     cp build/bootloader/bootloader.bin build/partition_table/partition-table.bin \
